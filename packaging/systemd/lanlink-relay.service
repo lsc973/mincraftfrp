@@ -1,0 +1,74 @@
+# lanlink 中继服务器 —— systemd 单元文件
+#
+# 安装步骤见 README「部署中继到 Linux 服务器」一节。简要版：
+#
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin lanlink
+#   sudo install -d -o lanlink -g lanlink /opt/lanlink /etc/lanlink
+#   sudo install -o lanlink -g lanlink lanlink-relay /opt/lanlink/
+#   sudo sh -c 'echo 你的口令 > /etc/lanlink/token'
+#   sudo chown lanlink:lanlink /etc/lanlink/token
+#   sudo chmod 600 /etc/lanlink/token
+#   sudo cp lanlink-relay.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now lanlink-relay
+#   systemctl status lanlink-relay
+#   journalctl -u lanlink-relay -f
+
+[Unit]
+Description=lanlink relay server（局域网联机工具的公网中继）
+Documentation=https://github.com/your/lanlink
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lanlink
+Group=lanlink
+WorkingDirectory=/opt/lanlink
+
+# 口令走文件而不是命令行参数 —— 命令行参数会出现在 ps 输出里，谁都看得见。
+# 也可以改用 Environment=LANLINK_RELAY_TOKEN=xxx，但环境变量同样能从
+# /proc/<pid>/environ 读到（只是需要更高的权限）。
+ExecStart=/opt/lanlink/lanlink-relay --bind 0.0.0.0 --port 9000 --token-file /etc/lanlink/token --log-level INFO
+
+# 优雅退出：收到 SIGTERM 后中继会把房间里的连接正常关掉再退。
+# 给 10 秒够用了，超时 systemd 会补一个 SIGKILL。
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+Restart=always
+RestartSec=5
+
+# 退出码 2 表示"端口起不来"这类配置错误，重试一万次也没用，
+# 只会把 journal 刷满。让它停在那儿等人工处理。
+RestartPreventExitStatus=2
+
+# 每客户端一个连接，一个房间最多 64 人。默认 soft limit 往往只有 1024，
+# 房间一多就会被"too many open files"打脸。
+LimitNOFILE=65536
+
+# ---- 安全加固 ----
+# 中继只做字节搬运，不写任何文件，所以能锁多紧锁多紧。
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# 想用 1024 以下的端口（80/443）就取消下面这行的注释。
+# 用 9000 这种高位端口不需要 root，也就用不着这个 capability。
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

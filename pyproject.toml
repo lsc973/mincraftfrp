@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lanlink"
+version = "0.1.0"
+description = "局域网优先的通用联机框架：房间发现、消息路由、公网中继，零依赖"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["lan", "multiplayer", "networking", "p2p", "relay", "udp-broadcast"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Games/Entertainment :: Multi-User Dungeons (MUD)",
+    "Topic :: Internet",
+    "Topic :: System :: Networking",
+]
+dependencies = []
+
+[project.scripts]
+lanlink = "lanlink.cli:main"
+
+[project.urls]
+Homepage = "https://example.invalid/lanlink"
+
+[tool.setuptools]
+# 必须把子包也列上。只写 "lanlink" 的话 gui/ 整个目录不会被打进 wheel，
+# 装完跑 `lanlink gui` 会直接 ImportError —— 而且从源码目录跑是好用的，
+# 特别容易漏过去。
+packages = ["lanlink", "lanlink.gui"]
