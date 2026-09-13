@@ -102,7 +102,10 @@ class TestTunnelFailureCleanup(unittest.TestCase):
     """
 
     def test_failed_relay_attach_closes_the_host(self):
-        import lanlink.gui.tunnel_page as tp
+        try:
+            import lanlink.gui.tunnel_page as tp
+        except ImportError as exc:   # 没装 tkinter 的机器
+            raise unittest.SkipTest(f"没有图形环境：{exc}")
 
         created = []
         real_host = tp.Host

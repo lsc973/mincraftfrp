@@ -20,7 +20,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from gui_helpers import find_grid_collisions, make_app, pump  # noqa: E402
+from gui_helpers import find_grid_collisions, make_app, pump, require_tk  # noqa: E402
+
+
+def setUpModule():
+    """没装 tkinter 就整块跳过，别报一堆加载失败。"""
+    require_tk()
 
 
 class TestNoLayoutCollisions(unittest.TestCase):

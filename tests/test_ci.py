@@ -184,5 +184,63 @@ class TestMakeZip(unittest.TestCase):
         self.assertIn("build.py", str(ctx.exception))
 
 
+
+class TestWorksWithoutTkinter(unittest.TestCase):
+    """没装 tkinter 的机器上，测试要干净地跳过而不是报一堆加载失败。
+
+    tkinter 是**可选**的：命令行版和中继在没有它的机器上照样跑（比如专门
+    跑中继的 Linux 服务器，或者 CI 里那个 Python 恰好没带 tcl/tk）。
+    那种情况下 unittest 该说"跳过"，不该甩出满屏 collection error ——
+    后者会让人以为是代码坏了，去查半天。
+    """
+
+    #: 在子进程里把 tkinter 屏蔽掉，模拟一台没装的机器。
+    #:
+    #: 必须实现 ``find_spec`` —— 老的 ``find_module`` 在 Python 3.12 起
+    #: 导入系统就不调了，写了也不生效。那种"静默不生效"最坑：测试照样绿，
+    #: 但其实什么都没屏蔽，真去开了几分钟窗口。
+    RUNNER = """
+import sys, unittest
+from importlib.abc import MetaPathFinder
+
+class Blocker(MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "tkinter" or name.startswith("tkinter."):
+            raise ImportError("simulated: no tkinter on this machine")
+        return None
+
+sys.meta_path.insert(0, Blocker())
+sys.path.insert(0, "tests")
+sys.path.insert(0, ".")
+
+suite = unittest.TestSuite()
+loader = unittest.TestLoader()
+for name in ("test_gui", "test_gui_layout", "test_gui_tunnel", "test_packaging"):
+    suite.addTests(loader.loadTestsFromName(name))
+result = unittest.TextTestRunner(verbosity=0).run(suite)
+print("RESULT", len(result.errors), len(result.failures), result.testsRun)
+sys.exit(1 if (result.errors or result.failures) else 0)
+"""
+
+    def test_gui_modules_skip_instead_of_erroring(self):
+        import subprocess
+
+        proc = subprocess.run(
+            [sys.executable, "-c", self.RUNNER],
+            cwd=str(PROJECT_ROOT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=300,
+        )
+        combined = proc.stdout + (proc.stderr or "")
+        self.assertNotIn("ModuleNotFoundError", combined)
+        self.assertIn("RESULT 0 0", combined,
+                      "没有 tkinter 时不该有错误或失败：\n" + combined[-1500:])
+        self.assertEqual(proc.returncode, 0, combined[-800:])
+
+    def test_gui_helpers_import_survives_a_missing_tkinter(self):
+        """导不进 tkinter 时 gui_helpers 本身也不能崩 —— 它提供跳过机制。"""
+        text = (PROJECT_ROOT / "tests" / "gui_helpers.py").read_text(encoding="utf-8")
+        self.assertIn("HAS_TK", text)
+        self.assertIn("def require_tk", text)
+
 if __name__ == "__main__":
     unittest.main()

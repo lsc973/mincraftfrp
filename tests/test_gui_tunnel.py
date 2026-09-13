@@ -14,10 +14,14 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from gui_helpers import NoDialogs, button_texts, make_app, pump, wait_for  # noqa: E402
+from gui_helpers import (  # noqa: E402
+    NoDialogs, button_texts, make_app, pump, require_tk, wait_for)
 from helpers import EchoServer, isolate_config  # noqa: E402
 from lanlink import Client, Host  # noqa: E402
-from lanlink.gui import tunnel_page  # noqa: E402
+try:   # 没装 tkinter 的机器上，这个 import 会连带把 tkinter 拉进来
+    from lanlink.gui import tunnel_page  # noqa: E402
+except Exception:  # pragma: no cover - 取决于跑测试的机器
+    tunnel_page = None  # type: ignore[assignment]
 from lanlink.tunnel import Tunnel  # noqa: E402
 
 
@@ -27,6 +31,7 @@ def setUpModule():
     不隔离的话，开发机上配了真域名，跑一遍测试就把它真的指来指去了 ——
     测试往第三方服务上写东西，绝对不能接受。
     """
+    require_tk()
     isolate_config()
 
 

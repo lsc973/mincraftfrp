@@ -87,7 +87,10 @@ class TestLaunchersImportable(unittest.TestCase):
         self.assertTrue(callable(mod.main))
 
     def test_gui_launcher_has_main_callable(self):
-        mod = _load_launcher("gui")
+        try:
+            mod = _load_launcher("gui")
+        except ImportError as exc:   # 没装 tkinter 的机器
+            raise unittest.SkipTest(f"没有图形环境：{exc}")
         self.assertTrue(callable(mod.main))
 
 

@@ -11,9 +11,27 @@ from __future__ import annotations
 
 import time
 import unittest
-from tkinter import messagebox
 
-import tkinter as tk
+# tkinter 是**可选**的：命令行版和中继在没装它的机器上照样跑（比如专门跑
+# 中继的 Linux 服务器）。所以这里 import 失败不能让整个测试模块加载不了 ——
+# 那样报的是一堆 collection error，而不是干净的"跳过"。
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+
+    HAS_TK = True
+    TK_ERROR = ""
+except Exception as exc:  # pragma: no cover - 取决于跑测试的机器
+    tk = None            # type: ignore[assignment]
+    messagebox = None    # type: ignore[assignment]
+    HAS_TK = False
+    TK_ERROR = f"{type(exc).__name__}: {exc}"
+
+
+def require_tk() -> None:
+    """没有 tkinter 就跳过整个模块。在测试模块的 ``setUpModule`` 里调。"""
+    if not HAS_TK:
+        raise unittest.SkipTest(f"没有可用的 tkinter（{TK_ERROR}），跳过图形界面测试")
 
 
 def make_app():

@@ -15,13 +15,26 @@ import sys
 import time
 import unittest
 from pathlib import Path
-from tkinter import messagebox
+# tkinter 是可选的：命令行版和中继在没装它的机器上照样跑。这里导入失败
+# 不能让整个模块加载不了 —— 那样报的是一堆 collection error，而不是干净的跳过。
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+except Exception:  # pragma: no cover - 取决于跑测试的机器
+    tk = None          # type: ignore[assignment]
+    messagebox = None  # type: ignore[assignment]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lanlink import Client, Host  # noqa: E402
 
-import tkinter as tk  # noqa: E402
+
+def setUpModule():
+    """没装 tkinter 就整块跳过，别报一堆加载失败。"""
+    from gui_helpers import require_tk
+
+    require_tk()
+
 
 
 def _make_app():
