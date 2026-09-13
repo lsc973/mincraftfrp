@@ -628,6 +628,7 @@ def _(source, data, is_json):
 - **`version_matrix.py`** —— 跨 Python 版本跑测试（见[兼容性](#兼容性)）
 - **`exe_smoke_test.py`** —— 把打包好的 exe 当黑盒跑一遍，确认它真的能用
 - **`make_release.py`** —— 把 exe 和一份使用说明收拾成可以直接发给对面的 zip
+- **`deploy_relay.sh`** —— 在全新的 Linux 服务器上一条命令装好中继（见[家里连不进来怎么办](docs/家里连不进来怎么办.md)）
 - **`relay_selftest.py`** —— 中继服务器自检，部署到 Linux 后在那台机器上跑
 - **`tunnel_e2e_test.py`** —— 隧道的端到端验证（三个真实进程 + 中继）
 

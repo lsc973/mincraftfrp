@@ -7,6 +7,7 @@ PyYAML 不是这个项目的依赖（项目本身零第三方依赖），装不�
 那部分检查，别让跑测试变成必须联网装包。
 """
 
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -256,3 +257,158 @@ sys.exit(1 if (result.errors or result.failures) else 0)
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeployScript(unittest.TestCase):
+    """VPS 一键部署脚本。
+
+    这个脚本只能跑在 Linux 上，而开发机是 Windows —— 所以**它没法在本地
+    完整跑一遍**。能测的部分尽量测掉：语法、参数解析、以及几个已知会出事的点。
+
+    没测到的部分（真的在 Ubuntu 上装服务）只能靠第一次部署时现场发现。
+    """
+
+    SCRIPT = PROJECT_ROOT / "tools" / "deploy_relay.sh"
+
+    def setUp(self):
+        self.text = self.SCRIPT.read_text(encoding="utf-8")
+
+    def test_exists_and_is_bash_syntax_valid(self):
+        self.assertTrue(self.SCRIPT.exists(), f"找不到 {self.SCRIPT}")
+        rc, _, err = self._run(["-n", str(self.SCRIPT)], timeout=60)
+        self.assertEqual(rc, 0, f"bash 语法错误：{err}")
+
+    def _parse_only(self):
+        """把参数解析那一段单独拎出来，好在 Windows 上测。
+
+        脚本开头就是 `[ "$(uname -s)" = "Linux" ] || die`，整脚本在这台
+        机器上跑不下去。所以只截取到解析完为止。
+        """
+        cut = self.text.index("----- 前置检查")
+        head = self.text[:cut].replace("set -euo pipefail", "")
+        return head + '\necho "PORT=[$PORT] TOKEN=[$TOKEN] FORCE=[$FORCE_TOKEN]"\n'
+
+    @classmethod
+    def _bash(cls):
+        """找到真正的 bash，找不到返回 None。
+
+        坑一：Windows 上 `bash` 可能解析到 System32 里的那个 —— 那是 WSL
+        的入口。WSL 没装的话它只打一句"未安装 Linux 发行版"（还是 UTF-16），
+        然后所有断言都莫名其妙地失败。**这个坑我踩过**：一开始以为是被测
+        脚本坏了，查了半天。
+
+        坑二：Git Bash 的 bash 和 WSL 的 bash 同名，PATH 顺序决定拿到哪个。
+        所以这里显式挑，不靠 PATH。
+        """
+        import os
+        import shutil
+
+        candidates = [
+            shutil.which("bash"),
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+        ]
+        for path in candidates:
+            if path and os.path.exists(path) and "System32" not in path:
+                return path
+        return None
+
+    def _run(self, args, timeout=20):
+        """跑一个命令，返回 (退出码, stdout, stderr)。
+
+        **不用 subprocess.run** —— Python 3.8 上它有个坑：进程"没产生任何
+        输出"时 `capture_output=True` 会在内部抛 IndexError（读线程留下的
+        数组是空的）。而参数出错时脚本正好是"秒退且无输出"，必踩。
+        Popen + communicate 没这个问题。
+        """
+        bash = self._bash()
+        if bash is None:
+            self.skipTest("这台机器上没有可用的 bash（Git Bash），跳过")
+        proc = subprocess.Popen([bash, *args],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise AssertionError(f"脚本卡死了（{timeout} 秒没结束）：{args}")
+        # 中文在 Windows 上可能是 GBK 出来的，两种都试
+        def decode(raw):
+            for enc in ("utf-8", "gbk"):
+                try:
+                    return raw.decode(enc)
+                except UnicodeDecodeError:
+                    continue
+            return raw.decode("utf-8", "replace")
+        return proc.returncode, decode(out), decode(err)
+
+    def _run_parse(self, *args):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "parse.sh"
+            path.write_text(self._parse_only(), encoding="utf-8")
+            return self._run([str(path), *args])
+
+    def test_defaults(self):
+        _, out, _ = self._run_parse("--token", "abc")
+        self.assertIn("PORT=[9000]", out)
+        self.assertIn("TOKEN=[abc]", out)
+
+    def test_equals_form(self):
+        _, out, _ = self._run_parse("--token=xyz", "--port=8080")
+        self.assertIn("PORT=[8080]", out)
+        self.assertIn("TOKEN=[xyz]", out)
+
+    def test_missing_value_does_not_hang(self):
+        """这条是真踩过的：`--token` 写在最后会让 shift 失败，而失败之后
+        $# 不变，于是 while 原地转圈 —— 脚本卡死还不报错。
+
+        所以这里必须能跑完（超时会被 subprocess 抛出来，测试就红）。
+        """
+        for flag in ("--token", "--port", "--repo"):
+            rc, out, err = self._run_parse(flag)
+            self.assertNotEqual(rc, 0, f"{flag} 缺值应该报错")
+            self.assertIn("要跟一个值", out + err)
+
+    def test_unknown_flag_is_rejected(self):
+        rc, out, err = self._run_parse("--nope")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("不认识的参数", out + err)
+
+    def test_refuses_to_run_off_linux(self):
+        """在 Windows/macOS 上直接跑应该干净地拒绝，而不是半路出错。"""
+        rc, out, err = self._run([str(self.SCRIPT), "--token", "x"], timeout=60)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("Linux", out + err)
+
+    # ---- 几个改对了才算数的地方 ----
+
+    def test_python_path_is_discovered_not_hardcoded(self):
+        """写死 /usr/bin/python3 的话，装在别处的机器上服务起不来，
+        而 systemd 报的是 "No such file or directory"，很难看出是解释器的事。
+        """
+        self.assertIn('PYTHON=$(command -v python3)', self.text)
+        self.assertIn("ExecStart=$PYTHON ", self.text)
+        self.assertNotIn("ExecStart=/usr/bin/python3", self.text)
+
+    def test_token_goes_through_a_file_not_the_command_line(self):
+        """命令行参数会出现在 ps 输出里，同一个机器上谁都能看到。"""
+        self.assertIn("--token-file", self.text)
+        exec_line = [l for l in self.text.splitlines() if l.startswith("ExecStart=")]
+        self.assertTrue(exec_line)
+        self.assertNotIn("--token ", exec_line[0])
+
+    def test_warns_about_the_cloud_security_list(self):
+        """脚本改不了云控制台那层。不提醒的话，用户会以为装好了，
+        然后对着"连不上"查半天防火墙。
+        """
+        self.assertIn("安全列表", self.text)
+        self.assertIn("安全组", self.text)
+
+    def test_keeps_an_existing_token_by_default(self):
+        """换了口令而没重新打包的话，对面手上那个 exe 里的口令就对不上，
+        他会一直连不上而两边都看不出原因。所以默认不动。
+        """
+        self.assertIn("force-token", self.text)
+        self.assertIn("FORCE_TOKEN", self.text)
