@@ -75,16 +75,35 @@ python tools/exe_smoke_test.py
 给别人的那份可以把服务器地址**编进 exe**。编了之后对方打开只看到两个空：
 房间号和口令，不需要知道也不需要填任何地址。
 
+服务器有两种，**选错了连不上**：
+
+| | 什么时候用 | 怎么编 |
+| --- | --- | --- |
+| **直连** | 你家能被外面连到（有公网 IP，或者有 IPv6 且防火墙放行） | `--server 你的地址:端口` |
+| **中继** | 家里连不进来（宽带在运营商大内网里、或者光猫的 IPv6 防火墙关不掉） | `--server-relay 公网机器:9000` |
+
 ```bash
+# 家里能被连到：把域名编进去
 python packaging/build.py --mode gui --server yourname.dynv6.net:50001 --label "给小明的"
+
+# 家里连不进来：得先有台公网机器跑中继（见[跨网段](#跨网段起一台中继)）
+python packaging/build.py --mode gui --server-relay 1.2.3.4:9000 --relay-token 口令 --label "给小明的"
+
 python tools/make_release.py --label "给小明的"
 ```
 
-第二条命令产出 `release/lanlink-给小明的.zip` —— 里面是 exe 加一份按情况
+最后一条产出 `release/lanlink-给小明的.zip` —— 里面是 exe 加一份按情况
 生成的 `使用说明.txt`。直接发过去就行。
 
-地址指向谁，谁就得能被外面连到（见[跨网段](#跨网段起一台中继)）。地址变了
-不用重新打包，`lanlink server set 新地址:端口` 就能改。
+**中继模式的好处**：你自己完全不需要能被外部访问，两边都是主动连出去的，
+什么防火墙都拦不住。这也是 CGNAT 宽带唯一走得通的路。
+
+地址变了不用重新打包：
+
+```bash
+lanlink server set 你的域名:50001                    # 改成直连
+lanlink server set 1.2.3.4:9000 --relay --token 口令  # 改成中继
+```
 
 #### 自动打包
 
@@ -609,7 +628,7 @@ def _(source, data, is_json):
 
 `packaging/` 下是打包相关：
 
-- **`build.py`** —— 一键打包（`--mode gui|cli|relay|both|all`，`--server` 把地址编进 exe）
+- **`build.py`** —— 一键打包（`--mode gui|cli|relay|both|all`；`--server` 编直连地址，`--server-relay` 编中继地址）
 - **`launcher_gui.py`** / **`launcher_cli.py`** / **`launcher_relay.py`** —— 三个入口
 - **`systemd/lanlink-relay.service`** —— Linux 服务单元（见[部署到 Linux](#部署中继到-linux-服务器)）
 

@@ -1241,3 +1241,174 @@ class TestRoomOnlyMode(unittest.TestCase):
         self.app.show_page("tunnel")
         pump(self.app, 0.2)
         self.assertEqual(label.cget("text"), "房间号")
+
+
+class TestBuiltinRelay(unittest.TestCase):
+    """内置的服务器是一台**中继**时，界面要按中继那套走。
+
+    这是家里被 CGNAT 或防火墙挡住时唯一还走得通的路：两边都主动连到一台
+    公网机器上，由它牵线。所以主机也必须挂上去 —— 不挂的话对方连到中继上，
+    主机还在局域网里开着房，两个人永远碰不到面。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = make_app()
+        cls.app.deiconify()
+        pump(cls.app, 0.3)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.app._on_close()
+        except Exception:
+            pass
+
+    def setUp(self):
+        from lanlink import server
+
+        server.clear()
+        self.dialogs = NoDialogs()
+        self.dialogs.__enter__()
+        self.app.nickname.set("中继测试")
+        self.page = self.app.pages["tunnel"]
+        self.service = EchoServer()
+        # 表单是共享的：上一个用例填过的值会留在这里，不重置就会互相干扰
+        for key, var in self.page.vars.items():
+            var.set("")
+        self.page.vars["target"].set("127.0.0.1:25565")
+        self.page.vars["listen"].set("25565")
+        self.app.show_page("start")
+        pump(self.app, 0.2)
+
+    def tearDown(self):
+        from lanlink import server
+
+        try:
+            self.page._stop_tunnel("")
+        except Exception:
+            pass
+        pump(self.app, 0.4)
+        server.clear()
+        self.service.close()
+        self.dialogs.__exit__()
+
+    # ------------------------------------------------------------ 表单
+
+    def test_client_uses_the_builtin_relay(self):
+        from lanlink import server
+
+        server.save("1.2.3.4:9000", mode="relay", token="relay-pw")
+        page = self.page
+        page.mode.set("client")
+        page._toggle_mode()
+        page.vars["room"].set("abc123")
+        page.vars["peer"].set("")
+
+        options = page._read_form()
+        self.assertIsNotNone(options)
+        self.assertEqual(options["relay"], ("1.2.3.4", 9000),
+                         "内置中继时该走中继，而不是直连")
+        self.assertTrue(options["relay_from_default"])
+        self.assertEqual(options["relay_token"], "relay-pw")
+        self.assertIsNone(options["peer"], "走中继时不该同时用直连地址")
+
+    def test_server_also_attaches_to_the_builtin_relay(self):
+        """主机不挂上去的话，两人根本碰不到面。"""
+        from lanlink import server
+
+        server.save("1.2.3.4:9000", mode="relay", token="relay-pw")
+        page = self.page
+        page.mode.set("server")
+        page._toggle_mode()
+        page.vars["target"].set("127.0.0.1:25565")
+        page.vars["room"].set("我的世界")
+
+        options = page._read_form()
+        self.assertIsNotNone(options)
+        self.assertEqual(options["relay"], ("1.2.3.4", 9000))
+        self.assertTrue(options["relay_from_default"])
+
+    def test_peer_field_is_hidden_for_a_builtin_relay_too(self):
+        from lanlink import server
+
+        server.save("1.2.3.4:9000", mode="relay")
+        page = self.page
+        page.mode.set("client")
+        page._toggle_mode()
+        pump(self.app, 0.1)
+        self.assertFalse(page._peer_row.winfo_ismapped(),
+                         "地址内置了还让用户看见「对方地址」，他会以为要填")
+
+    def test_room_number_is_required(self):
+        """中继上可能有很多房间，没有房间号就找不到。"""
+        from lanlink import server
+
+        server.save("1.2.3.4:9000", mode="relay")
+        page = self.page
+        page.mode.set("client")
+        page._toggle_mode()
+        page.vars["room"].set("")
+        self.assertIsNone(page._read_form())
+        self.assertTrue(self.dialogs.calls)
+
+    def test_field_says_room_number(self):
+        from lanlink import server
+
+        server.save("1.2.3.4:9000", mode="relay")
+        page = self.page
+        page.on_show()
+        pump(self.app, 0.1)
+        self.assertEqual(page._row_labels[page._room_row].cget("text"), "房间号")
+
+    # ------------------------------------------------------------ 分享
+
+    def test_share_text_does_not_leak_the_relay_address(self):
+        """对方那份 exe 里已经有中继地址了，别再把地址甩给他。"""
+        from lanlink import RelayServer, server
+
+        relay = RelayServer("127.0.0.1", 0).start()
+        self.addCleanup(relay.close)
+        server.save(f"127.0.0.1:{relay.port}", mode="relay", token="relay-pw")
+        page = self.page
+        page.mode.set("server")
+        page._toggle_mode()
+        page.vars["target"].set(f"127.0.0.1:{self.service.port}")
+        page.vars["room"].set("中继分享房")
+        page.vars["relay"].set("")
+        page.vars["password"].set("pw")
+        page._start()
+        self.assertTrue(
+            wait_for(self.app, lambda: page.tunnel is not None, timeout=25.0),
+            "隧道没建起来：" + page.log.text.get("1.0", "end")[-300:])
+        pump(self.app, 0.3)
+
+        text = page._share_text(page._running_options)
+        self.assertIn("房间号", text)
+        self.assertIn(page.node.room_id, text)
+        self.assertNotIn(f"127.0.0.1:{relay.port}", text,
+                         "中继地址不该出现在给对方的说明里")
+        self.assertNotIn("--relay", text)
+
+    def test_command_line_relay_still_shows_the_address(self):
+        """界面上临时指定的中继，对方不知道这台，得把地址告诉他。"""
+        from lanlink import RelayServer, server
+
+        relay = RelayServer("127.0.0.1", 0).start()
+        self.addCleanup(relay.close)
+        server.save("127.0.0.1:1", mode="relay")   # 内置一个不存在的，全靠手填
+        page = self.page
+        page.mode.set("server")
+        page._toggle_mode()
+        page.vars["target"].set(f"127.0.0.1:{self.service.port}")
+        page.vars["room"].set("临时中继房")
+        page.vars["relay"].set(f"127.0.0.1:{relay.port}")   # 手填一台真的
+        page._start()
+        self.assertTrue(
+            wait_for(self.app, lambda: page.tunnel is not None, timeout=25.0),
+            "隧道没建起来：" + page.log.text.get("1.0", "end")[-300:])
+        pump(self.app, 0.3)
+
+        text = page._share_text(page._running_options)
+        self.assertIn(f"127.0.0.1:{relay.port}", text)
+        self.assertIn("中继地址", text)

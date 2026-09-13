@@ -154,12 +154,19 @@ _DEFAULTS_TEMPLATE = '''"""打包时写进去的默认值。
 #: 默认服务器地址，形如 "yourname.dynv6.net:50001"。空表示没编进去。
 DEFAULT_SERVER = {server}
 
+#: "direct"（直连，对面连到你机器）或 "relay"（中继，两边连到一台公网机器）。
+SERVER_MODE = {mode}
+
+#: 中继口令。只有 SERVER_MODE == "relay" 时用得上。
+RELAY_TOKEN = {token}
+
 #: 打包这个 exe 时用的说明，显示给用户看（比如"这是给小明的那份"）。
 LABEL = {label}
 '''
 
 
-def write_build_defaults(server: str, label: str) -> None:
+def write_build_defaults(server: str, label: str, *,
+                         mode: str = "direct", token: str = "") -> None:
     """把默认值写进 lanlink/_build_defaults.py。
 
     每次打包都重写（没给 --server 就写空），这样"打出来的 exe 里到底是什么"
@@ -167,19 +174,27 @@ def write_build_defaults(server: str, label: str) -> None:
     exe 里的地址跟上一次打包的一样，看着像根本没生效。
     """
     server = (server or "").strip()
+    token = (token or "").strip()
+    if mode not in ("direct", "relay"):
+        raise ValueError(f"模式只能是 direct 或 relay，收到 {mode!r}")
     if server:
         # 在这里就校验，别等打包跑完几分钟才因为地址写错白忙一场
         from lanlink.link import parse_addr
 
         if parse_addr(server) is None:
             raise ValueError(
-                f"--server 格式不对：{server!r}。应该是 host:端口，"
+                f"服务器地址格式不对：{server!r}。应该是 host:端口，"
                 f"比如 yourname.dynv6.net:50001；IPv6 要加方括号，比如 [240e::1]:50001。"
             )
+    elif mode != "direct" or token:
+        raise ValueError("没给服务器地址，就不该指定模式或中继口令")
 
     target = Path(__file__).resolve().parent.parent / "lanlink" / "_build_defaults.py"
     target.write_text(
-        _DEFAULTS_TEMPLATE.format(server=repr(server), label=repr((label or "").strip())),
+        _DEFAULTS_TEMPLATE.format(
+            server=repr(server), mode=repr(mode), token=repr(token),
+            label=repr((label or "").strip()),
+        ),
         encoding="utf-8",
     )
 
@@ -193,24 +208,41 @@ def main() -> int:
     parser.add_argument("--clean", action="store_true", help="打包前清掉缓存")
     parser.add_argument(
         "--server",
-        help="把默认服务器地址编进 exe（如 yourname.dynv6.net:50001）。"
-             "编了之后对面只要填房间号和口令就能连，不用知道地址。",
+        help="把默认**直连**地址编进 exe（如 yourname.dynv6.net:50001）。"
+             "要求你家能被外面连到（公网 IP 或 IPv6）。",
     )
+    parser.add_argument(
+        "--server-relay",
+        help="把默认**中继**地址编进 exe（如 1.2.3.4:9000）。"
+             "家里被 CGNAT 或防火墙挡住、连不进来时用这个 —— "
+             "两边都主动连到那台公网机器上，由它牵线。",
+    )
+    parser.add_argument("--relay-token", help="中继口令，配合 --server-relay 用")
     parser.add_argument("--label", help="这份 exe 是给谁的，显示在界面上（如「给小明的」）")
     args = parser.parse_args()
 
+    if args.server and args.server_relay:
+        print("--server 和 --server-relay 只能给一个：一个是直连，一个是中继。",
+              file=sys.stderr)
+        return 2
+
+    address = args.server or args.server_relay or ""
+    mode = "relay" if args.server_relay else "direct"
     try:
-        write_build_defaults(args.server or "", args.label or "")
+        write_build_defaults(address, args.label or "",
+                             mode=mode, token=args.relay_token or "")
     except ValueError as exc:
         print(f"参数有问题：{exc}", file=sys.stderr)
         return 2
 
     version = check_pyinstaller()
     print(f"Python {sys.version.split()[0]} / PyInstaller {version}")
-    if args.server:
-        print(f"默认服务器地址：{args.server}")
+    if args.server_relay:
+        print(f"默认服务器：{args.server_relay}（中继）")
+    elif args.server:
+        print(f"默认服务器：{args.server}（直连）")
     else:
-        print("默认服务器地址：没编（对面需要自己填地址，或者靠局域网搜索）")
+        print("默认服务器：没编（对面需要自己填地址，或者靠局域网搜索）")
 
     if args.mode == "both":
         modes = ["gui", "cli"]

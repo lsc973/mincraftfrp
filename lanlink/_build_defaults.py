@@ -10,5 +10,11 @@
 #: 默认服务器地址，形如 "yourname.dynv6.net:50001"。空表示没编进去。
 DEFAULT_SERVER = ''
 
+#: "direct"（直连，对面连到你机器）或 "relay"（中继，两边连到一台公网机器）。
+SERVER_MODE = 'direct'
+
+#: 中继口令。只有 SERVER_MODE == "relay" 时用得上。
+RELAY_TOKEN = ''
+
 #: 打包这个 exe 时用的说明，显示给用户看（比如"这是给小明的那份"）。
 LABEL = ''

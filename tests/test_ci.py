@@ -46,6 +46,18 @@ class TestWorkflow(unittest.TestCase):
         inputs = self.workflow[True if "on" not in self.workflow else "on"]["workflow_dispatch"]["inputs"]
         self.assertIn("server", inputs)
 
+    def test_also_takes_a_relay(self):
+        """家里连不进来（CGNAT / 光猫防火墙关不掉）时，中继是唯一走得通的路。
+
+        工作流里没有这个输入的话，那些人就只能本机打包，自动打包对他们没用。
+        """
+        inputs = self.workflow[True if "on" not in self.workflow else "on"]["workflow_dispatch"]["inputs"]
+        self.assertIn("server_relay", inputs)
+        self.assertIn("relay_token", inputs)
+
+        script = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("--server-relay", script)
+
     def test_referenced_scripts_exist(self):
         """工作流里写到的每个路径都得真的在仓库里。
 

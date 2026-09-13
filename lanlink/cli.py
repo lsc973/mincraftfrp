@@ -426,6 +426,13 @@ def cmd_tunnel(args) -> int:
               "要么用 --addr <地址> 直接连，要么用 --relay 走中继", file=sys.stderr)
         return 2
 
+    # 打包时编进去的 / 配置文件里设的服务器。服务端和客户端都要用。
+    default_server = servercfg.resolve()
+
+    #: 这个服务器是不是"本来就配好、对面也知道"的那一个。
+    #: 是的话就不用把地址写给对方 —— 他那边已经有了。
+    share_by_room_only = False
+
     # ---- 先把本地这头准备好，再去连房间 ----
     tunnel = None
     node = None
@@ -442,13 +449,27 @@ def cmd_tunnel(args) -> int:
             ).start()
             print(f"房间已创建：{node.room_name}（房间号 {node.room_id}）")
             print(f"局域网地址：{format_addr(node.address, node.port)}")
+
+            # 该挂哪台中继。命令行上明说的优先；没说的话，看默认服务器是不是
+            # 中继 —— **主机也必须挂上去**，否则对方连到中继上，
+            # 而主机还在局域网里开着房，两个人永远碰不到面。
+            relay_target = None
+            relay_token = ""
+            if args.relay:
+                relay_target = args.relay
+                relay_token = args.relay_token or ""
+            elif default_server is not None and default_server.is_relay:
+                relay_target = (default_server.host, default_server.port)
+                relay_token = args.relay_token or default_server.token
+                share_by_room_only = True
+                print(f"用内置的中继：{default_server.address}")
+
             relay_arg = None
             room_arg = None
-            if args.relay:
-                host, port = args.relay
+            if relay_target is not None:
+                host, port = relay_target
                 room_arg = args.room or node.room_id
-                node.attach_relay(host, port, room_id=room_arg,
-                                  token=args.relay_token or "")
+                node.attach_relay(host, port, room_id=room_arg, token=relay_token)
                 relay_arg = format_addr(host, port)
                 print(f"已挂中继：{relay_arg}   房间号 {room_arg}")
 
@@ -459,14 +480,17 @@ def cmd_tunnel(args) -> int:
             # 房间端口是随机分配的，让对方去连个 54003 既没道理也容易看错。
             print()
             listen_hint = args.to[1]
-            if relay_arg is not None:
-                print(share_text(listen=listen_hint, password=args.password or "",
-                                 relay=relay_arg, room=room_arg))
-            elif servercfg.resolve() is not None:
-                # 地址已经编进对方的 exe 了（或者他自己配过），所以对方只要
-                # 房间号 + 口令。这里的房间号就是本机的 room_id。
-                print(share_text(listen=listen_hint, password=args.password or "",
+            password = args.password or ""
+
+            if share_by_room_only or (relay_arg is None and default_server is not None):
+                # 地址已经在对方的 exe 里（直连或中继都算），所以他只要
+                # 房间号 + 口令。房间号就是本机的 room_id。
+                print(share_text(listen=listen_hint, password=password,
                                  room=node.room_id, server_default=True))
+            elif relay_arg is not None:
+                # 命令行上临时指定的中继 —— 对方不知道这台，得把地址告诉他
+                print(share_text(listen=listen_hint, password=password,
+                                 relay=relay_arg, room=room_arg))
             else:
                 v6 = global_ipv6()
                 share_host = _publish_ddns(v6)
@@ -474,11 +498,9 @@ def cmd_tunnel(args) -> int:
                     print("注意：没检测到全球 IPv6，下面这个局域网地址出了这个网段就没人连得上。")
                 print(share_text(
                     address=format_addr(share_host or v6 or node.address, node.port),
-                    listen=listen_hint, password=args.password or "",
+                    listen=listen_hint, password=password,
                 ))
         else:
-            # 没给地址时用它。地址可能是打包时编进 exe 的，也可能是配置里设的。
-            default_server = servercfg.resolve()
             if args.relay:
                 host, port = args.relay
                 if not args.room:
@@ -498,12 +520,28 @@ def cmd_tunnel(args) -> int:
                                       password=args.password or "")
                 check_room(node, args.room)
             elif default_server is not None:
-                # 地址是编在 exe 里 / 配置里设好的，用户只给了房间号和口令
-                host, port = default_server
-                print(f"正在连接 {format_addr(host, port)} …")
-                node = Client.connect(host, port, name=f"{nickname} #tunnel",
-                                      password=args.password or "")
-                check_room(node, args.room)
+                # 地址是编在 exe 里 / 配置里设好的，用户只给了房间号和口令。
+                # 两种模式说的话完全不一样：中继要 join_via_relay，
+                # 直连才是 Client.connect。搞混了只会得到一个莫名其妙的失败。
+                if default_server.is_relay:
+                    if not args.room:
+                        print(f"内置的服务器是台中继，必须用 --room 指定房间号",
+                              file=sys.stderr)
+                        return 2
+                    token = args.relay_token or default_server.token
+                    print(f"正在通过中继 {default_server.address} "
+                          f"加入房间「{args.room}」…")
+                    node = Client.join_via_relay(
+                        default_server.host, default_server.port, args.room,
+                        name=f"{nickname} #tunnel",
+                        password=args.password or "", token=token)
+                    check_room(node, args.room)
+                else:
+                    print(f"正在连接 {default_server.address} …")
+                    node = Client.connect(default_server.host, default_server.port,
+                                          name=f"{nickname} #tunnel",
+                                          password=args.password or "")
+                    check_room(node, args.room)
             else:
                 print(f"正在局域网里找房间「{args.room}」…")
                 info = _find_room(args.room, args.discovery_port, args.timeout)
@@ -607,13 +645,21 @@ def cmd_server(args) -> int:
     action = getattr(args, "server_action", None) or "show"
 
     if action == "set":
+        mode = server.MODE_RELAY if args.relay else server.MODE_DIRECT
         try:
-            address = server.save(args.address)
+            endpoint = server.save(args.address, mode=mode, token=args.token or "")
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
-        print(f"好了，对面现在只要填房间号和口令就能连到 {format_addr(*address)}。")
-        print(f"（存在 {server.config.config_path()}；打包时也可以用 --server 直接编进 exe）")
+        print(f"好了，对面现在只要填房间号和口令就能连上"
+              f"（走{endpoint.kind} {endpoint.address}）。")
+        if endpoint.is_relay:
+            print("中继模式下，你自己不需要能被外面连到 —— 两边都主动连出去。")
+            if not endpoint.token:
+                print("提示：你的中继如果不设口令，谁都能拿来中转。"
+                      "建议给中继加个口令，再用 --token 填在这儿。")
+        print(f"（存在 {server.config_path()}；"
+              f"打包时也可以用 --server 或 --server-relay 直接编进 exe）")
         return 0
 
     if action == "clear":
@@ -623,7 +669,8 @@ def cmd_server(args) -> int:
             print("配置文件里本来就没设。")
         from_build = server.baked()
         if from_build is not None:
-            print(f"注意：打包时编进 exe 的 {format_addr(*from_build)} 还在，会重新生效。")
+            print(f"注意：打包时编进 exe 的 {from_build.address}"
+                  f"（{from_build.kind}）还在，会重新生效。")
         return 0
 
     print(server.describe())
@@ -955,8 +1002,15 @@ def build_parser() -> argparse.ArgumentParser:
     s = server_sub.add_parser("show", help="看看现在用的是哪个地址（默认）")
     s.set_defaults(func=cmd_server)
 
-    s = server_sub.add_parser("set", help="设置地址")
+    s = server_sub.add_parser(
+        "set", help="设置地址（默认是直连；加 --relay 表示这是台中继）",
+        description="直连要求你家能被外面连到（公网 IP 或 IPv6）。"
+                    "被 CGNAT / 防火墙挡住时用 --relay 指向一台公网机器。",
+    )
     s.add_argument("address", help="host:端口，如 yourname.dynv6.net:50001")
+    s.add_argument("--relay", action="store_true",
+                   help="这是个中继地址（两边都连它，你自己不需要能被外部访问）")
+    s.add_argument("--token", help="中继口令，配合 --relay 用")
     s.set_defaults(func=cmd_server)
 
     s = server_sub.add_parser("clear", help="删掉（打包时编进去的会重新生效）")

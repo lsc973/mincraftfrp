@@ -150,11 +150,18 @@ class TunnelPage(ttk.Frame):
     def _toggle_mode(self) -> None:
         """按角色显示/隐藏对应的字段，并刷新跟着配置变的那几处文案。"""
         self._refresh_room_label()
+        builtin = servercfg.resolve()
         if self.mode.get() == "server":
             self._listen_row.grid_remove()
             self._peer_row.grid_remove()
             self._target_row.grid()
-            if servercfg.resolve() is not None:
+            if builtin is not None and builtin.is_relay:
+                self.hint.configure(
+                    text="隧道会把你填的服务地址（本机上的服务）开放给房间里的人。\n"
+                         f"内置了一台中继（{builtin.address}），启动后会自动挂上去 ——\n"
+                         "你自己不需要能被外面连到。把「房间号」和口令发给对方就行。"
+                )
+            elif builtin is not None:
                 self.hint.configure(
                     text="隧道会把你填的服务地址（本机上的服务）开放给房间里的人。\n"
                          "地址已经内置好了，启动之后把「房间号」和口令发给对方，"
@@ -171,12 +178,14 @@ class TunnelPage(ttk.Frame):
             self._target_row.grid_remove()
             self._listen_row.grid()
             self._peer_row.grid()
-            if servercfg.resolve() is not None:
+            if builtin is not None:
                 # 地址已经内置了 —— 这是给"对面"用的那份 exe，他只填房间号和口令
                 self._peer_row.grid_remove()
+                via = "中继" if builtin.is_relay else "直连"
                 self.hint.configure(
                     text="隧道会在本机开一个端口，连这个端口就等于连到了对面那台机器的服务。\n"
-                         "服务器地址是内置好的，你只要填开房的人给你的**房间号**和口令。\n"
+                         f"服务器地址是内置好的（{via}），你只要填开房的人给你的"
+                         "「房间号」和口令。\n"
                          "端口只写数字时绑 127.0.0.1（只给本机程序连）。"
                 )
             else:
@@ -199,42 +208,15 @@ class TunnelPage(ttk.Frame):
         """把表单读成参数，顺便校验。返回 None 表示校验没过。"""
         values = {k: v.get().strip() for k, v in self.vars.items()}
         is_server = self.mode.get() == "server"
+        default = servercfg.resolve()
 
-        # 「对方地址」：填了就直连，跳过局域网搜索 —— 虚拟局域网
-        # （Tailscale/ZeroTier）和公网 IP + 端口映射这两种情况都靠它，
-        # 两者都不需要中继。
-        peer = None
-        if not is_server and values["peer"]:
-            peer = parse_addr(values["peer"])
-            if peer is None:
-                messagebox.showerror(
-                    "对方地址不对",
-                    "格式应该是 host:端口，比如 192.168.1.10:50001。\n"
-                    "IPv6 要加方括号，比如 [240e:354::1]:50001。",
-                    parent=self)
-                return None
-
-        # 地址编在 exe 里（或配置里）的时候，用户什么都不用填 —— 直接用它。
-        using_default = False
-        if not is_server and peer is None and not values["relay"]:
-            default = servercfg.resolve()
-            if default is not None:
-                peer, using_default = default, True
-
-        # 房间名/房间号什么时候必须填：
-        #   · 靠局域网搜索找房 —— 得按名字找
-        #   · 用编好的地址连 —— 得靠房间号确认连对了没有
-        # 自己填了完整地址时反而不用（对面就一间房，连上就是它）。
-        if not values["room"] and (peer is None or using_default):
-            if using_default:
-                messagebox.showinfo(
-                    "缺房间号",
-                    "地址已经内置了，填上开房的人给你的房间号就能连。", parent=self)
-            else:
-                messagebox.showinfo("缺房间名", "房间名两端要填一样的。", parent=self)
-            return None
-
+        # ---- 走不走中继 ----
+        # 命令行上填的中继优先；没填的话，看内置的服务器是不是一台中继。
+        # **服务端也要走这一步** —— 内置中继时主机必须自己挂上去，
+        # 否则对方连到中继上，主机还在局域网里开着房，两人碰不到面。
         relay = None
+        relay_token = values["relay_token"]
+        relay_from_default = False
         if values["relay"]:
             relay = parse_addr(values["relay"])
             if relay is None:
@@ -244,6 +226,48 @@ class TunnelPage(ttk.Frame):
                     "IPv6 要加方括号，比如 [240e::1]:9000。",
                     parent=self)
                 return None
+        elif default is not None and default.is_relay:
+            relay = (default.host, default.port)
+            relay_token = values["relay_token"] or default.token
+            relay_from_default = True
+
+        # ---- 对方地址（只有客户端用得上）----
+        # 填了就直连，跳过局域网搜索 —— 虚拟局域网（Tailscale/ZeroTier）
+        # 和公网 IP + 端口映射这两种情况都靠它。
+        peer = None
+        using_default = False
+        if not is_server:
+            if values["peer"]:
+                peer = parse_addr(values["peer"])
+                if peer is None:
+                    messagebox.showerror(
+                        "对方地址不对",
+                        "格式应该是 host:端口，比如 192.168.1.10:50001。\n"
+                        "IPv6 要加方括号，比如 [240e:354::1]:50001。",
+                        parent=self)
+                    return None
+            elif relay is None and default is not None:
+                # 内置的是直连地址，用户什么都不用填
+                peer = (default.host, default.port)
+                using_default = True
+
+        # 房间名/房间号什么时候必须填：
+        #   · 靠局域网搜索找房 —— 得按名字找
+        #   · 走中继 —— 中继上可能有很多房间，得靠房间号找
+        #   · 用内置的直连地址连 —— 得靠房间号确认连对了没有
+        # 自己填了完整地址时反而不用（对面就一间房，连上就是它）。
+        if not values["room"] and (peer is None or using_default):
+            if using_default:
+                messagebox.showinfo(
+                    "缺房间号",
+                    "服务器地址已经内置了，填上开房的人给你的房间号就能连。",
+                    parent=self)
+            elif relay is not None:
+                messagebox.showinfo("缺房间号", "走中继要填开房的人给你的房间号。",
+                                    parent=self)
+            else:
+                messagebox.showinfo("缺房间名", "房间名两端要填一样的。", parent=self)
+            return None
 
         if is_server:
             if ":" not in values["target"]:
@@ -270,7 +294,9 @@ class TunnelPage(ttk.Frame):
             "nickname": self.app.nickname.get().strip() or "隧道",
             "room": values["room"],
             "relay": relay,
-            "relay_token": values["relay_token"],
+            "relay_token": relay_token,
+            # 中继是内置的 → 对方那边也有，给他的信息就只要房间号
+            "relay_from_default": relay_from_default,
             "password": values["password"],
             "target": target if is_server else None,
             "listen": None if is_server else listen,
@@ -343,9 +369,13 @@ class TunnelPage(ttk.Frame):
                 tunnel = Tunnel(node, role="server", target=options["target"]).start()
             else:
                 if relay:
+                    # 中继和直连说的话完全不一样，搞混只会得到一个莫名的失败。
+                    # relay 可能是命令行填的，也可能是内置服务器带过来的。
                     node = Client.join_via_relay(*relay, room, name=f"{nickname} #tunnel",
                                                  password=password,
                                                  token=options["relay_token"])
+                    # 房间号填错了要当场说清楚，别让人莫名其妙进了别的房间
+                    check_room(node, room)
                 elif options.get("peer"):
                     # 直接连指定地址，不搜局域网。虚拟局域网、端口映射、
                     # 以及"地址编在 exe 里"这三种都走这条。
@@ -509,18 +539,22 @@ class TunnelPage(ttk.Frame):
     def _share_args(self, options: dict) -> dict:
         """对方连过来要用的参数。三种连法各是一套，不能混着说。
 
-        优先级跟客户端那边一致：中继 > 默认服务器 > 裸地址。
+        判断顺序跟命令行那边保持一致：**先看内置服务器**（不管它是直连还是
+        中继，对方手上都有这个地址，所以只给他房间号），再命令行临时指定的
+        中继，最后才是裸地址。
         """
         node = self.node
         listen = options["target"][1]
         common = {"listen": listen, "password": options.get("password", "")}
+
         relay = options.get("relay")
+        if options.get("relay_from_default") or (
+                relay is None and servercfg.resolve() is not None):
+            # 地址已经编进对方的 exe 了 —— 他只要房间号 + 口令
+            return dict(common, room=node.room_id, server_default=True)
         if relay is not None:
             room = node.relay.room_id if node.relay else options["room"]
             return dict(common, relay=format_addr(*relay), room=room)
-        if servercfg.resolve() is not None:
-            # 地址已经编进对方的 exe 了 —— 他只要房间号 + 口令
-            return dict(common, room=node.room_id, server_default=True)
         return dict(common, address=format_addr(self._advertised_host(), node.port))
 
     def _share_fields(self, options: dict) -> list:

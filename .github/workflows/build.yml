@@ -16,7 +16,15 @@ on:
   workflow_dispatch:
     inputs:
       server:
-        description: '默认服务器地址（host:端口）。填了对面就只要房间号+口令；留空则对面要自己填地址'
+        description: '【直连】你的地址（host:端口，如 yourname.dynv6.net:50001）。要求你家能被外面连到'
+        required: false
+        default: ''
+      server_relay:
+        description: '【中继】公网中继地址（host:端口，如 1.2.3.4:9000）。家里连不进来时填这个'
+        required: false
+        default: ''
+      relay_token:
+        description: '中继口令（配合上面的中继地址用）'
         required: false
         default: ''
       label:
@@ -58,11 +66,15 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
 
+      # --server 和 --server-relay 只能给一个（直连 / 中继是两条不同的路），
+      # 两个都留空也行 —— 那就打一个通用的包，对面自己填地址。
       - name: 打包
         shell: bash
         run: |
           python packaging/build.py --mode all \
             --server "${{ inputs.server }}" \
+            --server-relay "${{ inputs.server_relay }}" \
+            --relay-token "${{ inputs.relay_token }}" \
             --label "${{ inputs.label }}"
 
       # 打包成功不等于能跑。PyInstaller 经常打出一个双击就闪退的东西，
