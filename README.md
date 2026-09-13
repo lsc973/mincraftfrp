@@ -29,7 +29,9 @@ client.broadcast(b"大家好")
 | 断线检测 | 心跳 + 空闲超时。拔网线这种 TCP 不会立刻报错的情况也能及时清掉 |
 | 中继自建 | 一个命令跑起自己的中继，可选接入口令 |
 | 环境自检 | `lanlink doctor` 逐条检查防火墙、网段、端口，把"连不上"变成可执行的修复步骤 |
-| 图形界面 | tkinter 写的窗口程序，可打包成单文件 exe，对方不用装 Python |
+| 图形界面 | tkinter 写的窗口程序，可打包成单文件 exe，对方不用装 Python。房间、中继、隧道都在界面里 |
+| 端口转发隧道 | 把房间当虚拟网线，让异地的人连上你本机的任意 TCP 服务（Minecraft、远程桌面…） |
+| 公网可达性判断 | 问自家路由器要 WAN 口 IP，判断有没有公网 IP / 是否在大内网（UPnP，不依赖外部服务） |
 
 **不适合**什么：需要低延迟音视频流的场景（那是 WebRTC 的活）；这个框架擅长的是
 游戏状态同步、房间聊天、指令下发这类消息型通信。
@@ -42,12 +44,14 @@ client.broadcast(b"大家好")
 
 ### 方式一：直接跑 exe（推荐给普通用户）
 
-`dist/lanlink.exe` 是打包好的单文件程序，**对方不需要装 Python**，双击就能用：
+到 [Releases](https://github.com/lsc973/mincraftfrp/releases) 下载打包好的单文件程序，
+**对方不需要装 Python**，双击就能用（仓库里不再放二进制，那些是每次构建自动出的）：
 
 ```
 创建房间（当房主）   ← 建好把房间号发给朋友
 加入房间             ← 自动搜局域网，或手填地址 / 走中继
 我当中继服务器       ← 放公网机器上给跨网段的人中转
+端口转发隧道         ← 让异地的人连上你本机的服务（Minecraft 等）
 环境自检             ← 连不上先点这个
 ```
 
@@ -65,6 +69,37 @@ python packaging/build.py --mode both  # 图形版 + 命令行版
 ```bash
 python tools/exe_smoke_test.py
 ```
+
+#### 让对面什么都不用填
+
+给别人的那份可以把服务器地址**编进 exe**。编了之后对方打开只看到两个空：
+房间号和口令，不需要知道也不需要填任何地址。
+
+```bash
+python packaging/build.py --mode gui --server yourname.dynv6.net:50001 --label "给小明的"
+python tools/make_release.py --label "给小明的"
+```
+
+第二条命令产出 `release/lanlink-给小明的.zip` —— 里面是 exe 加一份按情况
+生成的 `使用说明.txt`。直接发过去就行。
+
+地址指向谁，谁就得能被外面连到（见[跨网段](#跨网段起一台中继)）。地址变了
+不用重新打包，`lanlink server set 新地址:端口` 就能改。
+
+#### 自动打包
+
+推个标签就出包，产物挂在 Release 里：
+
+```bash
+git tag v1.0 && git push --tags
+```
+
+或者在 GitHub 的 **Actions → 打包 exe → Run workflow** 手动跑，填上服务器
+地址和"给谁的"，跑完在页面底部下载 zip。
+
+工作流会依次做：跑测试 → 打包 → 把 exe 当黑盒验证 → 收拾成 zip → 上传。
+**先跑测试再打包**是有意的：打一个跑不起来的包比不打包更糟，对面拿到手才发现，
+你还得重新走一遍发文件的流程。
 
 ### 方式二：图形界面（从源码）
 
@@ -147,6 +182,187 @@ python -m lanlink host --room 我的房间 --relay 1.2.3.4:9000 --relay-token �
 ```bash
 python -m lanlink join --room 3f2a1b9c --relay 1.2.3.4:9000 --relay-token 你的口令
 ```
+
+---
+
+## 端口转发隧道：让朋友连上你本机的服务
+
+**这是另一个用法**：你本机跑着一个现成的服务（Minecraft 服务器、远程桌面、
+网页、数据库……），想让不在同一局域网的人连进来。
+
+问题是：你家大概率没有公网 IP（很多宽带是 CGNAT），对方**直接连不上**。
+而中继服务器虽然能当中转站，但它只搬 lanlink 自己的协议帧，不认识
+Minecraft 的协议 —— 把 Minecraft 客户端指向中继是连不上的。
+
+`lanlink tunnel` 在房间之上铺了一层流复用，把房间变成一条虚拟网线：
+
+```bash
+# 你这边（Minecraft 服务跑在 25565）
+python -m lanlink tunnel --room 我的世界 --to 127.0.0.1:25565 \
+    --relay 你的公网IP:9000 --relay-token 口令
+
+# 朋友那边
+python -m lanlink tunnel --room 我的世界 --listen 25565 \
+    --relay 你的公网IP:9000 --relay-token 口令
+```
+
+然后朋友在 Minecraft 里连 **`127.0.0.1:25565`** 就相当于连到了你家的 25565。
+
+**任何 TCP 服务都能穿**，不限 Minecraft。换个端口就是远程桌面、网页、SSH。
+
+### 连不上时看错误信息
+
+隧道建立失败会告诉你**连的是哪个地址、是超时还是被拒绝、该去查什么**，
+而不是甩一个裸的 `timed out`：:
+
+    连接中继 1.2.3.4:9000 超时（等了 10 秒还没连上）。
+    排查方向：中继地址/端口是否写对、中继服务是否在运行、
+    服务器防火墙和云安全组是否放行了这个端口。
+
+区分「超时」和「拒绝连接」很重要，两者原因完全不同：
+
+| 现象 | 含义 | 先去查 |
+|---|---|---|
+| **超时** | 包发出去了，没有任何回应 | 地址是否写对、防火墙/安全组是否放行、对端是否在跑 |
+| **拒绝连接** | 地址是通的，但那个端口没服务 | 端口号写错了，或者服务没启动 |
+
+### 图形界面里也能用
+
+主界面点「端口转发隧道」，选角色、填地址和房间名、点启动就行。
+运行中会实时显示活跃流数和上下行速度，换页面会自动停掉隧道。
+
+命令行和界面是同一套逻辑（都走 `lanlink/tunnel.py`），用哪个都行。
+
+### 三种连法，按需选
+
+**① 同一局域网** —— 广播自动搜索，什么都不用配：
+
+```bash
+# 服务端
+python -m lanlink tunnel --room 我的世界 --to 127.0.0.1:25565
+
+# 客户端
+python -m lanlink tunnel --room 我的世界 --listen 25565
+```
+
+**② 不同局域网，但能直连** —— 用 `--addr` 填对方地址，**不需要中继**：
+
+```bash
+# 服务端（照常起，不用挂中继）
+python -m lanlink tunnel --room x --to 127.0.0.1:25565 --port 50001
+
+# 客户端：直接填对方地址
+python -m lanlink tunnel --listen 25565 --addr <对方地址>:50001
+```
+
+什么时候能直连？两种常见情况：
+
+| 情况 | 对方地址填什么 |
+|---|---|
+| 装了 **Tailscale / ZeroTier** 之类的虚拟局域网 | 对方的虚拟 IP（Tailscale 是 `100.x.x.x`） |
+| 对方有**公网 IP** 并且路由器上做了端口映射 | 对方的公网 IP |
+
+这两条路都不经过中继，延迟最低。
+
+**没有服务器、也不想折腾？用 Tailscale 最省事**（免费，不需要你有任何服务器）：
+
+1. 两台机器都装上 [Tailscale](https://tailscale.com/)，登录同一个账号
+2. 跑 `lanlink doctor` —— 它会直接把虚拟局域网地址挑出来告诉你：
+   ```
+   [警告] 虚拟局域网：发现虚拟局域网地址：100.101.102.103（Tailscale）
+          这是跨网段联机最省事的办法 —— 两台机器装同一个工具并登录，
+          然后用「端口转发隧道」的「对方地址」直接填这个虚拟 IP，
+          既不需要中继，也不需要公网 IP / 端口映射。
+   ```
+3. 服务端照常起，客户端在「对方地址」里填**对方的**那个虚拟 IP
+
+同一招对 **ZeroTier / Hamachi / Radmin VPN** 也适用，doctor 都会认出来。
+
+**③ 不同局域网，但你有公网 IP** —— 在路由器上做个端口映射，**对面也不用装任何东西**：
+
+```bash
+# 路由器上：外部 50001 → 你的内网 192.168.1.6:50001
+
+# 服务端
+python -m lanlink tunnel --room x --to 127.0.0.1:25565 --port 50001
+
+# 客户端（对面只跑这个）
+python -m lanlink tunnel --listen 25565 --addr 你的公网IP:50001
+```
+
+先跑 `lanlink doctor` 确认一下自己有没有公网 IP —— 它会直接问路由器：
+
+```
+[通过] 公网可达：路由器 WAN 口是 113.87.1.1 —— 是公网地址
+        好消息：你有公网 IP。
+        在路由器上把某个端口映射到本机（比如外部 50001 → 本机 50001），
+        然后让对面用「端口转发隧道」的「对方地址」填 <你的公网IP>:50001。
+        对面只跑 lanlink.exe 就行，不需要中继、也不用装别的东西。
+```
+
+如果是**运营商大内网（CGNAT）**，自检会直接说清楚这条路走不通：
+
+```
+[失败] 公网可达：路由器 WAN 口是 100.64.0.7 —— 运营商大内网（CGNAT）
+        你的宽带没有公网 IP，外面的人路由不到你，端口映射也救不了。三条出路：
+          · 打运营商客服申请公网 IP（电信/联通有时能给，移动基本不给）
+          · 两边都装 Tailscale 之类的虚拟局域网，然后直连
+          · 找台有公网 IP 的机器跑中继
+```
+
+判断依据是问路由器「你的 WAN 口 IP 是多少」（UPnP），**不依赖任何外部服务**。
+路由器没开 UPnP 的话问不到，自检会退回来告诉你怎么手动看。
+
+**④ 不同局域网，直连不了** —— 只能走中继：
+
+```bash
+python -m lanlink tunnel --room 我的世界 --listen 25565     --relay 你的公网IP:9000 --relay-token 口令
+```
+
+为什么直连不了就得用中继？因为两台机器都在 NAT 后面时，**谁也主动连不上谁** ——
+这跟软件无关，是 TCP 的性质。必须有第三方在中间搭桥（中继），
+或者通过端口映射 / 虚拟局域网把其中一方变得"可直接到达"。
+
+### 参数说明
+
+| 参数 | 说明 |
+|---|---|
+| `--to 地址:端口` | **服务在这边**。隧道会把流量转发到这个本地地址 |
+| `--listen [地址:]端口` | **服务在对面**。本地开这个端口给本机程序连 |
+| `--room` | 房间名（局域网模式）/ 中继上的房间号（中继模式）。两端必须一致 |
+| `--addr 地址:端口` | **客户端**：直接连这个地址，跳过局域网搜索。虚拟局域网 / 公网 IP 用这条，不需要中继 |
+| `--relay` / `--relay-token` | 走公网中继 |
+| `--password` | 房间密码，防止别人蹭你的隧道 |
+
+`--listen` 只写端口时默认绑 **`127.0.0.1`** —— 只给本机程序连。写成
+`0.0.0.0:25565` 才会对同网段开放，那等于把服务暴露给整个局域网，别不小心。
+
+### 多个人同时连
+
+一条隧道能同时跑多条流，每个人一个 Minecraft 连接互不干扰。房间里也可以有
+多个人同时用（流是按人 + 流号区分的）。
+
+### 和"联机框架"是什么关系
+
+同一个中继、同一条连接、同一套口令，只是上面跑的东西不同：
+
+```
+┌─ 你的程序 ──── lanlink 房间消息（send / broadcast / on("data")）
+│
+└─ 现成的服务 ── lanlink 隧道（tunnel --to / --listen）
+                    ↑ 都是走同一条连接和中继
+```
+
+隧道帧就是普通的房间应用数据加 9 字节头（`"LLTK" + 流号 + 操作码`），所以心跳、
+掉线检测、中继转发、二进制完整性这些全都自动复用现成的 ——
+`protocol.py` / `link.py` / `relay.py` 一行没改。
+
+### 已知限制
+
+- **只支持 TCP**。UDP 转发没做（Minecraft Java 版是 TCP，基岩版走 UDP，穿不了）。
+- 所有流共用一条连接，某条流把发送缓冲撑满时会短暂影响其他流。同时跑几十条
+  大流量流才会明显，一两条连接的场景完全够用。
+- 服务端（`--to` 那侧）固定当房间主机，所以要能主动连出去（有中继的话只需要出网）。
 
 ---
 
@@ -387,11 +603,13 @@ def _(source, data, is_json):
 - **`soak_test.py`** —— 长时间稳定性压测（见[长时间稳定性](#长时间稳定性)）
 - **`version_matrix.py`** —— 跨 Python 版本跑测试（见[兼容性](#兼容性)）
 - **`exe_smoke_test.py`** —— 把打包好的 exe 当黑盒跑一遍，确认它真的能用
+- **`make_release.py`** —— 把 exe 和一份使用说明收拾成可以直接发给对面的 zip
 - **`relay_selftest.py`** —— 中继服务器自检，部署到 Linux 后在那台机器上跑
+- **`tunnel_e2e_test.py`** —— 隧道的端到端验证（三个真实进程 + 中继）
 
 `packaging/` 下是打包相关：
 
-- **`build.py`** —— 一键打包（`--mode gui|cli|relay|both|all`）
+- **`build.py`** —— 一键打包（`--mode gui|cli|relay|both|all`，`--server` 把地址编进 exe）
 - **`launcher_gui.py`** / **`launcher_cli.py`** / **`launcher_relay.py`** —— 三个入口
 - **`systemd/lanlink-relay.service`** —— Linux 服务单元（见[部署到 Linux](#部署中继到-linux-服务器)）
 
@@ -408,12 +626,15 @@ lanlink/
 ├── discovery.py   UDP 广播发现：Beacon（主机侧）/ Scanner（客户端侧）
 ├── node.py        Host / Client / RelayAttachment —— 房间逻辑都在这里
 ├── relay.py       公网中继服务器
-├── doctor.py      环境自检（防火墙 / 网段 / 端口 / 收发自测）
+├── tunnel.py      端口转发隧道：在房间之上做流复用
+├── doctor.py      环境自检（公网可达性 / 防火墙 / 网段 / 端口 / 收发自测）
+├── upnp.py        问路由器要 WAN IP、自动开端口（纯标准库实现）
 ├── text.py        文本编码兜底（终端 GBK / 孤立代理字符）
 ├── cli.py         命令行
 └── gui/           图形界面（tkinter）
     ├── app.py     主窗口、线程安全队列、各对话框
-    ├── pages.py   起始页 / 房间页 / 中继页
+    ├── pages.py   起始页 / 房间页 / 中继页 / 自检弹窗
+    ├── tunnel_page.py  端口转发隧道页
     └── widgets.py 聊天区、成员表、房间列表、字体与 DPI 适配
 ```
 
@@ -505,6 +726,59 @@ app.post(self.chat.add, "小明", "你好")
 问题 —— 有时候能跑、有时候卡死、有时候在别人机器上才崩，非常难查。
 `tests/test_gui.py` 里有专门验证这条队列的测试（多线程灌 200 条更新，一条都不能丢）。
 
+**踩过的两个真坑**，都是同一个根因，值得单独记一笔：
+
+| 错误写法 | 后果 |
+|---|---|
+| 后台线程里 `self.app.nickname.get()` | `RuntimeError: main thread is not in main loop` |
+| 后台线程里 `self.after(0, callback)` | 同上 |
+
+`StringVar.get()` 和 `after()` 看着不像"动控件"，但**它们都会进 Tcl**，
+所以照样受限。实测这三种写法在后台线程里**全都会抛异常**：
+
+```python
+app.nickname.get()      # RuntimeError: main thread is not in main loop
+app.after(0, fn)        # 同上
+app.set_status("x")     # 同上
+```
+
+规矩很简单：**后台线程里除了 `app.post(...)`，什么都别碰。**
+需要读输入框的值，就在主线程读好、当参数传进去。这两个坑现在都有回归测试守着
+（`tests/test_gui_tunnel.py`）。
+
+### 布局的坑：控件建在了错误的 parent 上
+
+同一个隧道页还踩过一个**功能测试完全查不出来**的问题：6 个输入框全压在了
+「我是哪一边」的单选按钮上面。
+
+根因是 tkinter 的一条规则：
+
+> ``widget.grid()`` 永远用控件**自己的 parent** 当几何主。
+
+所以「先把控件 new 出来，再让辅助函数把它摆进某个容器」这种写法**行不通** ——
+控件会跑进它自己 parent 的格子里：
+
+```python
+def _labeled(self, parent, row, label, widget):   # widget 的 parent 是 form
+    holder = ttk.Frame(parent)
+    holder.grid(row=row, ...)
+    widget.grid(row=0, column=1)   # ← 进了 form 的 (0,1)，不是 holder 的
+```
+
+正确的做法是**让辅助函数自己创建控件**，parent 传 holder：
+
+```python
+def _labeled(self, parent, row, label, var):
+    holder = ttk.Frame(parent)
+    holder.grid(row=row, ...)
+    entry = ttk.Entry(holder, textvariable=var)   # parent 是 holder
+    entry.grid(row=0, column=1)                   # ← 正确落位
+```
+
+这种 bug 功能测试全绿（控件都在、值也对、事件也正常），只有肉眼能看出来。
+所以加了个几何检查 `tests/test_gui_layout.py`：遍历所有页面和弹窗，确认
+没有两个控件抢同一个网格格子。它自己有测试守着（故意制造冲突，确认能被检出）。
+
 ### 打包成 exe 踩的坑
 
 PyInstaller 打出来的东西在编码上跟源码运行不一样，两个坑都值得记：
@@ -530,7 +804,7 @@ PyInstaller 打出来的东西在编码上跟源码运行不一样，两个坑�
 python -m unittest discover -s tests -v
 ```
 
-150 个测试，全部是真的起 socket、真的连、真的发数据，包括中继和混合组网场景。
+245 个测试，全部是真的起 socket、真的连、真的发数据，包括中继和混合组网场景。
 GUI 那部分用 `app.update()` 手动驱动事件循环，把界面当普通对象来断言（会有一个
 窗口出现，见 `tests/test_gui.py` 开头的说明）。
 
@@ -541,6 +815,11 @@ python -m unittest tests.test_lifecycle     # 资源回收 / 引用环 / 幽灵�
 python -m unittest tests.test_doctor        # 环境自检的解析逻辑
 python -m unittest tests.test_gui           # 图形界面（需要一个可见的桌面）
 python -m unittest tests.test_packaging     # 打包配置 / systemd 单元 / 入口透传
+python -m unittest tests.test_tunnel        # 端口转发隧道（真起 TCP 服务验证）
+python -m unittest tests.test_gui_tunnel    # 隧道页面 + 自检弹窗（需要可见桌面）
+python -m unittest tests.test_gui_layout    # 布局检查：控件不能互相盖住
+python -m unittest tests.test_errors        # 错误信息必须能照着排查
+python -m unittest tests.test_upnp          # UPnP 解析与 CGNAT 判定
 ```
 
 ### 兼容性
@@ -549,7 +828,7 @@ python -m unittest tests.test_packaging     # 打包配置 / systemd 单元 / �
 
 | Python | 3.8.6 | 3.9.25 | 3.10.20 | 3.11.15 | 3.12.13 | 3.13.13 | 3.14.5 |
 |---|---|---|---|---|---|---|---|
-| 150 项测试 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 245 项测试 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ```bash
 python tools/version_matrix.py        # 自己再跑一遍这个矩阵

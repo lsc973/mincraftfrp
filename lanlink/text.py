@@ -19,15 +19,21 @@ __all__ = ["safe_print", "safe_input", "encode_text", "force_utf8_when_piped"]
 
 
 def safe_print(text: str = "") -> None:
-    """往终端打字，但别因为编码问题把程序搞崩。"""
+    """往终端打字，但别因为编码问题把程序搞崩。
+
+    带 flush：输出被重定向到文件或管道时 stdout 是块缓冲的，不刷的话
+    「该发给对方什么」这类要立刻照做的东西会卡在缓冲区里，用户盯着一个
+    空屏幕等。这些输出都是低频的，刷一下不心疼。
+    """
     try:
-        print(text)
+        print(text, flush=True)
     except UnicodeEncodeError:
         encoding = getattr(sys.stdout, "encoding", None) or "ascii"
         try:
-            print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+            print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"),
+                  flush=True)
         except Exception:
-            print(text.encode("ascii", errors="replace").decode("ascii"))
+            print(text.encode("ascii", errors="replace").decode("ascii"), flush=True)
 
 
 def safe_input(prompt: str = "") -> str:
@@ -73,6 +79,10 @@ def force_utf8_when_piped() -> None:
             continue
         try:
             if not stream.isatty():
-                stream.reconfigure(encoding="utf-8", errors="replace")
+                # line_buffering 一并打开：重定向/管道时默认是块缓冲，攒够
+                # 几 KB 才吐一次。像「隧道已开好，把下面这段发给对方」这种
+                # 要用户立刻照做的提示，会卡在缓冲区里让人对着空屏幕干等。
+                stream.reconfigure(encoding="utf-8", errors="replace",
+                                   line_buffering=True)
         except (AttributeError, ValueError, OSError):
             pass  # 老 Python 或特殊流，跳过就是

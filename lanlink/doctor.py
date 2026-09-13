@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import socket
 import subprocess
@@ -101,35 +102,43 @@ def _powershell(script: str, timeout: float = 25.0) -> Optional[str]:
     return proc.stdout.decode("utf-8", errors="replace")
 
 
-def _firewall_profiles_for_python() -> Optional[Set[str]]:
-    """哪些防火墙配置文件放行了 python.exe 的入站。拿不到就返回 None。"""
-    if not IS_WINDOWS:
-        return None
-    script = (
-        "Get-NetFirewallRule -ErrorAction SilentlyContinue | "
-        "Where-Object { $_.DisplayName -like '*python*' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' -and $_.Enabled -eq 'True' } | "
-        "Select-Object -ExpandProperty Profile | ConvertTo-Json -Compress"
-    )
-    raw = _powershell(script)
-    if raw is None:
-        return None
-    raw = raw.strip()
-    if not raw:
-        return set()
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return None
-    if isinstance(data, int):
-        data = [data]
-    elif not isinstance(data, list):
-        return None
+def _running_program() -> str:
+    """当前进程的可执行文件路径。
 
-    # Profile 是位标志枚举：Domain=1, Private=2, Public=4, All=0(实际输出 2147483647 之类)
+    防火墙规则是**按程序**放行的，不是按进程名。``python.exe`` 的规则对打包
+    出来的 ``lanlink.exe`` 一点都不生效 —— 只查 python 会让 exe 用户看到
+    「防火墙通过」，实际入站却被挡在外面，这正是最难查的那类问题。
+    """
+    try:
+        return sys.executable or ""
+    except Exception:  # pragma: no cover - 解释器被拆掉时的兜底
+        return ""
+
+
+def _normalize_program(path: str) -> str:
+    """统一的程序路径写法，用来比对。大小写和斜杠方向都可能不一样。"""
+    path = (path or "").strip()
+    return os.path.normcase(os.path.normpath(path)) if path else ""
+
+
+def _profiles_from_values(values) -> Set[str]:
+    """把 Profile 值解析成名字集合。
+
+    Profile 是位标志枚举（Domain=1, Private=2, Public=4, 全选 0x7FFFFFFF），
+    但 PowerShell 序列化成字符串时给的是 ``"Domain, Private"`` 这种逗号写法，
+    两种都得认。
+    """
     names: Set[str] = set()
-    for value in data:
+    for value in values:
         if isinstance(value, str):
-            names.add(value)
+            for part in value.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if part.lower() == "any":
+                    names.update({"Domain", "Private", "Public"})
+                else:
+                    names.add(part)
             continue
         if not isinstance(value, int):
             continue
@@ -143,6 +152,60 @@ def _firewall_profiles_for_python() -> Optional[Set[str]]:
         if value & 4:
             names.add("Public")
     return names
+
+
+def _firewall_profiles_for(program: str) -> Optional[Set[str]]:
+    """哪些防火墙配置文件放行了这个程序的入站。拿不到就返回 None。
+
+    查法上有个坑：一条一条规则去取 ``Get-NetFirewallApplicationFilter`` 慢到
+    不能用（本机几百条规则，三分钟都跑不完）。改成先把 ApplicationFilter
+    一次性全捞出来建索引，再跟规则表在内存里对，整个查询三秒出头。
+    """
+    if not IS_WINDOWS:
+        return None
+
+    wanted = _normalize_program(program)
+    if not wanted:
+        return None
+
+    script = (
+        "$af = @{}; "
+        "Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue | "
+        "ForEach-Object { $af[$_.InstanceID] = $_.Program }; "
+        "Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True "
+        "-ErrorAction SilentlyContinue | ForEach-Object { "
+        "$p = $af[$_.InstanceID]; "
+        "if ($p) { [PSCustomObject]@{ P = [string]$_.Profile; F = $p } } } | "
+        "ConvertTo-Json -Compress"
+    )
+    raw = _powershell(script)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return set()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if isinstance(data, dict):
+        data = [data]
+    elif not isinstance(data, list):
+        return None
+
+    matched = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        target = item.get("F")
+        if not isinstance(target, str):
+            continue
+        # 只认明确点名了这个程序的规则。Program=Any 的要么是端口规则、要么
+        # 绑在某个系统服务上，直接算数会造出「看着放行了其实没有」——
+        # 而那正是这个检查要防的事。
+        if _normalize_program(target) == wanted:
+            matched.append(item.get("P"))
+    return _profiles_from_values(matched)
 
 
 #: PowerShell 的 NetworkCategory 枚举。ConvertTo-Json 会把它序列化成数字，
@@ -248,15 +311,22 @@ def check_firewall() -> Check:
             warn_only=True,
         )
 
-    profiles = _firewall_profiles_for_python()
+    program = _running_program()
+    name = os.path.basename(program) or "本程序"
+    profiles = _firewall_profiles_for(program)
     category = _network_category()
+    fix = (
+        "以管理员身份打开 PowerShell，执行：\n"
+        f"      New-NetFirewallRule -DisplayName 'lanlink' -Direction Inbound "
+        f"-Program '{program}' -Action Allow -Profile Any"
+    )
     if profiles is None:
         return Check(
             "防火墙",
             True,
             "查询失败（可能没有权限），无法确认",
-            "手动查一下：设置 → 网络和 Internet → Windows 防火墙 → 允许应用通过防火墙，"
-            "确认 Python 在“专用”和“公用”两栏都打了勾。",
+            f"手动查一下：设置 → 网络和 Internet → Windows 防火墙 → 允许应用通过防火墙，\n"
+            f"  确认 {name} 在「专用」和「公用」两栏都打了勾。",
             warn_only=True,
         )
 
@@ -264,25 +334,26 @@ def check_firewall() -> Check:
     category_text = f"，当前网络类别 {category}" if category else ""
     wanted = _CATEGORY_TO_PROFILE.get(category, category) if category else None
 
-    if wanted and wanted not in profiles:
-        return Check(
-            "防火墙",
-            False,
-            f"Python 已放行的配置文件：{label}{category_text} —— 当前类别没被覆盖",
-            "这是跨机器连不上最常见的原因。以管理员身份运行 PowerShell，执行：\n"
-            "      New-NetFirewallRule -DisplayName 'lanlink' -Direction Inbound "
-            "-Program (Get-Command python).Source -Action Allow -Profile Any\n"
-            "    或者手动到「允许应用通过防火墙」里，把 Python 的“专用”和“公用”都勾上。",
-        )
     if not profiles:
         return Check(
             "防火墙",
             False,
-            f"没有找到任何 Python 的入站放行规则{category_text}",
-            "首次监听端口时 Windows 通常会弹窗询问，点“允许”即可。"
-            "没弹过或点了取消的话，按上面的命令手动加一条。",
+            f"没有找到放行 {name} 入站的规则{category_text}",
+            f"Windows 防火墙默认挡掉所有入站连接，而规则是绑程序的 —— "
+            f"{name} 没被放行，别人就连不进来。\n"
+            "首次监听端口时 Windows 一般会弹窗问，点「允许」就行；没弹过或者点了取消的话：\n"
+            + fix + "\n"
+            "  顺手确认一下：如果网络类别是「公用」，弹窗里只勾「专用」是不够的。",
         )
-    return Check("防火墙", True, f"Python 已放行：{label}{category_text}")
+    if wanted and wanted not in profiles:
+        return Check(
+            "防火墙",
+            False,
+            f"{name} 已放行的配置文件：{label}{category_text} —— 当前类别没被覆盖",
+            "这是跨机器连不上最常见的原因。\n" + fix + "\n"
+            f"  或者手动到「允许应用通过防火墙」里，把 {name} 的「专用」和「公用」都勾上。",
+        )
+    return Check("防火墙", True, f"{name} 已放行：{label}{category_text}")
 
 
 # ---------------------------------------------------------------- 端口与自测
@@ -367,10 +438,109 @@ def check_round_trip() -> Check:
             host.close()
 
 
+#: 虚拟局域网工具的网卡名关键字 → 显示名。
+#: 装了这些工具的话，两台机器就有了一条"第三条路"：
+#: 用虚拟 IP 直连，既不用中继也不用公网 IP。
+_VPN_ADAPTER_HINTS = {
+    "tailscale": "Tailscale",
+    "zerotier": "ZeroTier",
+    "hamachi": "Hamachi",
+    "radmin": "Radmin VPN",
+    "wireguard": "WireGuard",
+    "openvpn": "OpenVPN",
+    "nebula": "Nebula",
+}
+
+def _is_cgnat_shared(address: str) -> bool:
+    """是不是 100.64.0.0/10（RFC 6598 共享地址段）。
+
+    Tailscale 默认就用这一段。注意是 /10 —— 第二段 64~127 都算，
+    只匹配 "100.64." 会漏掉 100.100.x.x 之类的地址。
+    """
+    parts = address.split(".")
+    if len(parts) != 4 or parts[0] != "100":
+        return False
+    try:
+        return 64 <= int(parts[1]) <= 127
+    except ValueError:
+        return False
+
+
+def _is_hamachi(address: str) -> bool:
+    """Hamachi 用的是 25.0.0.0/8。"""
+    return address.startswith("25.") and address.count(".") == 3
+
+
+#: 按 IP 段兜底识别（网卡名拿不到时用）。
+_VPN_IP_RANGES = (
+    (_is_cgnat_shared, "Tailscale（100.64.0.0/10 共享地址段）"),
+    (_is_hamachi, "Hamachi"),
+)
+
+
+def _virtual_lan_addresses() -> list:
+    """找出虚拟局域网（Tailscale / ZeroTier 之类）的地址。
+
+    返回 [(地址, 工具名), ...]。拿不到就返回空列表 —— 这只是锦上添花的信息，
+    查不到不该影响自检结果。
+    """
+    found = []
+
+    if IS_WINDOWS:
+        raw = _powershell(
+            "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+            "Select-Object IPAddress,InterfaceAlias | ConvertTo-Json -Compress"
+        )
+        if raw and raw.strip():
+            try:
+                items = json.loads(raw)
+            except ValueError:
+                items = None
+            if isinstance(items, dict):
+                items = [items]
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                alias = str(item.get("InterfaceAlias", ""))
+                address = str(item.get("IPAddress", ""))
+                if not address:
+                    continue
+                for keyword, label in _VPN_ADAPTER_HINTS.items():
+                    if keyword in alias.lower():
+                        found.append((address, label))
+                        break
+
+    known = {addr for addr, _ in found}
+    for address in all_local_ips():
+        if address in known:
+            continue
+        for matches, label in _VPN_IP_RANGES:
+            if matches(address):
+                found.append((address, label))
+                break
+
+    return found
+
+
 def check_interfaces() -> Check:
     """把本机所有非回环地址列出来，方便跟对面机器比对网段。"""
     ips = all_local_ips()
     real = [ip for ip in ips if not ip.startswith("127.")]
+    vpn = _virtual_lan_addresses()
+
+    if vpn:
+        detail = "、".join(f"{addr}（{label}）" for addr, label in vpn)
+        return Check(
+            "虚拟局域网",
+            True,
+            f"发现虚拟局域网地址：{detail}",
+            "这是跨网段联机最省事的办法 —— 两台机器装同一个工具并登录，\n"
+            "然后用「端口转发隧道」的「对方地址」直接填这个虚拟 IP，\n"
+            "既不需要中继，也不需要公网 IP / 端口映射。\n"
+            "（注意：对方也得装同一个工具，并且登录到同一个网络里。）",
+            warn_only=True,
+        )
+
     if len(real) > 1:
         return Check(
             "多网卡",
@@ -385,10 +555,123 @@ def check_interfaces() -> Check:
 # ---------------------------------------------------------------- 汇总
 
 
+def check_ipv6() -> Check:
+    """有没有全球可达的 IPv6。
+
+    **这条比 IPv4 那条更值得看**：国内运营商大范围上了 IPv6，而且 IPv6
+    通常**不做 NAT** —— 每台设备拿到的就是全球可路由的地址。所以哪怕宽带
+    在运营商大内网里（IPv4 没有公网地址），只要两边都有 IPv6，照样能直连，
+    不需要中继、对方也不用装任何东西。
+    """
+    from .discovery import global_ipv6
+
+    address = global_ipv6()
+    if not address:
+        return Check(
+            "IPv6",
+            True,
+            "没有全球可达的 IPv6 地址",
+            "如果 IPv4 那边也查出来在大内网，那「不用中继」这条路就走不通了，\n"
+            "只能选：申请公网 IP / 两边装虚拟局域网 / 用中继。",
+            warn_only=True,
+        )
+
+    return Check(
+        "IPv6",
+        True,
+        f"有全球可达的 IPv6：{address}",
+        "好消息：IPv6 一般不做 NAT，外面能直接连到这台机器。\n"
+        "  用法：把隧道服务端跑起来，让对方在「对方地址」里填\n"
+        f"        [{address}]:端口\n"
+        "  对方只要有 IPv6 就行（国内运营商基本都铺了），不用装任何东西。\n"
+        "  注意：如果连不上，先看路由器有没有开 IPv6 防火墙、\n"
+        f"        Windows 防火墙有没有放行 {os.path.basename(_running_program()) or '本程序'}。",
+        warn_only=True,
+    )
+
+
+def check_public_address() -> Check:
+    """本机能不能被外网直接连上。
+
+    这一项决定了"不用中继、对面也不装东西"这条路走不走得通：
+
+    * 有公网 IP → 在路由器上做个端口映射就行，对面只跑 lanlink 就能直连
+    * 运营商大内网（CGNAT）→ 外网根本路由不到你，端口映射也没用
+
+    判断办法是问自家路由器"你的 WAN 口 IP 是多少"（UPnP），
+    不依赖任何外部服务。路由器不开 UPnP 的话就问不到，那就退回让用户自己看。
+    """
+    from . import upnp
+    from .discovery import global_ipv6
+
+    try:
+        wan = upnp.get_external_ip()
+    except upnp.GatewayError as exc:
+        return Check(
+            "公网可达",
+            True,
+            f"查不到（{exc}）",
+            "手动确认一下：登录路由器后台（一般是 192.168.1.1），看「WAN 口 / 外网 IP」。\n"
+            "  · 100.64.x.x / 10.x / 172.x / 192.168.x → 运营商大内网或多层 NAT，\n"
+            "    外网连不进来，只能靠中继或虚拟局域网\n"
+            "  · 公网地址（比如 113.x.x.x、1.2.3.4）→ 可以做端口映射，\n"
+            "    对面只跑 lanlink.exe 就能直连，不需要中继、也不用装别的东西",
+            warn_only=True,
+        )
+
+    if upnp.is_cgnat(wan):
+        v6 = global_ipv6()
+        if v6:
+            # 有全球 IPv6 就别急着判死刑 —— IPv4 这条路确实断了，但
+            # 「对面什么都不装」在 IPv6 上是走得通的，只差路由器放不放行。
+            return Check(
+                "公网可达",
+                True,
+                f"IPv4 是运营商大内网（WAN 口 {wan}），但本机有全球 IPv6",
+                "IPv4 这条路不通：没有公网 IP，外面路由不到你，端口映射也救不了。\n"
+                f"  改走 IPv6 —— 地址是 {v6}，把隧道服务端跑起来，让对方在\n"
+                f"  「对方地址」里填 [{v6}]:端口。对方只要有 IPv6 就行，不用装任何东西。\n"
+                "  唯一没把握的是路由器/光猫的 IPv6 防火墙放不放行入站，这个只能实测。\n"
+                "  万一不通：打运营商客服申请公网 IP / 两边装 Tailscale / 找台公网机器跑中继。",
+                warn_only=True,
+            )
+        return Check(
+            "公网可达",
+            False,
+            f"路由器 WAN 口是 {wan} —— 运营商大内网（CGNAT）",
+            "你的宽带没有公网 IP，外面的人路由不到你，端口映射也救不了。三条出路：\n"
+            "  · 打运营商客服申请公网 IP（电信/联通有时能给，移动基本不给）\n"
+            "  · 两边都装 Tailscale 之类的虚拟局域网，然后直连\n"
+            "  · 找台有公网 IP 的机器跑中继\n"
+            "「对面只跑 lanlink.exe、什么都不装」这个要求，在 CGNAT 下做不到。",
+        )
+
+    if not upnp.is_public_address(wan):
+        return Check(
+            "公网可达",
+            False,
+            f"路由器 WAN 口是 {wan} —— 内网地址，说明上面还挂着一层路由",
+            "多层 NAT，外网同样连不进来。把上层那台设备也做端口映射，"
+            "或者改成光猫桥接 + 路由器拨号，才能拿到公网 IP。",
+        )
+
+    return Check(
+        "公网可达",
+        True,
+        f"路由器 WAN 口是 {wan} —— 是公网地址",
+        "好消息：你有公网 IP。\n"
+        "在路由器上把某个端口映射到本机（比如外部 50001 → 本机 50001），\n"
+        "然后让对面用「端口转发隧道」的「对方地址」填 <你的公网IP>:50001。\n"
+        "对面只跑 lanlink.exe 就行，不需要中继、也不用装别的东西。",
+    )
+
+
 def run_checks(discovery_port: int = DISCOVERY_PORT) -> List[Check]:
     return [
         check_local_ips(),
         check_interfaces(),
+        check_ipv6(),
+        check_public_address(),
         check_firewall(),
         check_discovery_port(discovery_port),
         check_tcp_bind(),
@@ -405,9 +688,14 @@ def render_report(checks: List[Check], discovery_port: int = DISCOVERY_PORT) -> 
     ]
     for check in checks:
         lines.append(f"{check.mark} {check.name}：{check.detail}")
-        if check.advice and not check.ok:
+        # 建议一律打出来，不只是失败的时候。
+        # "查不到"（warn_only 且 ok）这类最需要指引 —— 比如 UPnP 问不到路由器时，
+        # 用户正需要知道怎么手动去看 WAN 口 IP，藏起来就等于没说。
+        if check.advice:
             for advice_line in check.advice.splitlines():
-                lines.append(f"        {advice_line.strip()}")
+                # 不要 strip —— 建议里的缩进是有意义的（子条目、命令示例），
+                # 抹掉之后层级就看不出来了
+                lines.append(f"        {advice_line}".rstrip())
 
     failed = [c for c in checks if not c.ok and not c.warn_only]
     warned = [c for c in checks if not c.ok and c.warn_only]

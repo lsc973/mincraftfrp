@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from .discovery import DISCOVERY_PORT, Beacon, RoomInfo, local_ip
-from .link import Link, connect
+from .link import Link, bind_reusable, connect
 from .protocol import (
     KIND_APP,
     KIND_JSON,
@@ -73,6 +73,76 @@ RELAY_ID_BASE = 1_000_000
 
 #: 握手阶段最多等多久（秒）。
 HANDSHAKE_TIMEOUT = 10.0
+
+
+#: 连不上时给出的排查方向。裸的 socket 异常只有一个 "timed out"，
+#: 用户既不知道是哪一步失败，也不知道该去查什么。
+_HINT_RELAY = (
+    "排查方向：中继地址/端口是否写对、中继服务是否在运行、"
+    "服务器防火墙和云安全组是否放行了这个端口。"
+)
+_HINT_HOST = (
+    "排查方向：主机地址/端口是否写对、主机是否已经开房、"
+    "两台机器是否在同一网段、主机防火墙是否放行。"
+)
+
+
+def _dial(host: str, port: int, timeout: float, what: str, hint: str):
+    """建立一条 outbound 连接；失败时把上下文说清楚。
+
+    直接往上抛 socket.timeout 的话，界面上只会显示 "timeout: timed out"，
+    用户完全无从下手 —— 这个函数就是来解决这个的。
+    """
+    try:
+        return connect(host, port, timeout=timeout)
+    except socket.timeout:
+        raise ConnectionError(
+            f"连接{what} {host}:{port} 超时（等了 {timeout:.0f} 秒还没连上）。{hint}"
+        ) from None
+    except ConnectionRefusedError:
+        raise ConnectionRefusedError(
+            f"{what} {host}:{port} 拒绝连接 —— 地址是通的，但那个端口上没有服务在监听。{hint}"
+        ) from None
+    except OSError as exc:
+        raise ConnectionError(f"连接{what} {host}:{port} 失败：{exc}。{hint}") from None
+
+
+#: 绑定 "0.0.0.0" 时是否尽量用双栈（一个 socket 同时收 IPv4 和 IPv6）。
+#: 关掉可以强制只监听 IPv4 —— 排查问题时有用。
+DUAL_STACK = True
+
+
+def _make_listener(bind_host: str, port: int) -> socket.socket:
+    """建一个监听 socket，能用 IPv6 就用双栈。
+
+    **为什么要双栈**：很多宽带在运营商大内网（CGNAT）后面，IPv4 根本没有
+    公网地址，但 IPv6 是有的 —— 而且 IPv6 通常不做 NAT，外面能直接连进来。
+    只监听 IPv4 的话，这条路就白白浪费了。
+
+    双栈的关键是 ``IPV6_V6ONLY=0``：设上之后一个绑在 ``::`` 上的 socket
+    能同时接受 IPv4 和 IPv6 连接。设不上（少数系统不支持）就退回纯 IPv4，
+    免得出现"绑了 :: 结果 IPv4 客户端全连不上"这种更难查的问题。
+    """
+    wants_any = bind_host in ("0.0.0.0", "", "::")
+
+    if DUAL_STACK and wants_any and socket.has_ipv6:
+        try:
+            dual = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            bind_reusable(dual)
+            dual.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            dual.bind(("::", port))
+            return dual
+        except OSError as exc:
+            log.debug("双栈监听不可用（%s），退回 IPv4", exc)
+            try:
+                dual.close()
+            except OSError:
+                pass
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    bind_reusable(server)
+    server.bind((bind_host if bind_host != "::" else "0.0.0.0", port))
+    return server
 
 
 def default_name() -> str:
@@ -270,9 +340,7 @@ class Host(Node):
         """绑定端口、开始监听和广播。返回 self，方便链式调用。"""
         if self._started:
             return self
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((self.bind_host, self.port))
+        server = _make_listener(self.bind_host, self.port)
         server.listen(32)
         self._server = server
         self.port = server.getsockname()[1]
@@ -673,7 +741,7 @@ class Client(Node):
     ) -> "Client":
         """直连一台主机。"""
         client = cls(name)
-        client._link = link or connect(host, port, timeout=timeout)
+        client._link = link or _dial(host, port, timeout, "主机", _HINT_HOST)
         client._link.name = "host"
         client._link.on_frame = client._on_frame
         client._link.on_close = client._on_link_close
@@ -697,7 +765,7 @@ class Client(Node):
         timeout: float = 10.0,
     ) -> "Client":
         """通过公网中继加入一间房。"""
-        link = connect(relay_host, relay_port, timeout=timeout)
+        link = _dial(relay_host, relay_port, timeout, "中继", _HINT_RELAY)
         link.name = "relay"
         client = cls(name)
         client._link = link
@@ -897,7 +965,8 @@ class RelayAttachment:
                 failure.append(str(msg.get("message") or msg.get("reason") or "中继拒绝接入"))
                 ready.set()
 
-        link = connect(self.relay_host, self.relay_port, timeout=self.timeout, on_frame=on_frame)
+        link = _dial(self.relay_host, self.relay_port, self.timeout, "中继", _HINT_RELAY)
+        link.on_frame = on_frame
         link.name = "relay"
         link.start()
         link.send_json({

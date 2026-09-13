@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import socket
+import sys
 import threading
 import time
 from typing import Callable, Optional, Tuple
@@ -29,9 +30,92 @@ from .protocol import (
     unpack_json,
 )
 
-__all__ = ["Link", "LinkClosed"]
+__all__ = [
+    "Link",
+    "LinkClosed",
+    "bind_reusable",
+    "connect",
+    "format_addr",
+    "parse_addr",
+    "parse_listen_addr",
+]
 
 log = logging.getLogger("lanlink.link")
+
+
+def format_addr(host: str, port: int) -> str:
+    """把地址和端口拼成能看懂的形式。
+
+    IPv6 必须加方括号：``240e::1`` 后面直接跟 ``:50001`` 会变成
+    ``240e::1:50001``，谁也分不清哪段是端口 —— 而且这个字符串会被当地址
+    解析回去，不加括号直接就解析错了。
+    """
+    if ":" in host:
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+def parse_addr(text: str, *, allow_zero: bool = False) -> Optional[Tuple[str, int]]:
+    """解析 ``host:port``，支持 IPv6 的 ``[地址]:端口`` 写法。
+
+    解析不了返回 None。CLI 和图形界面都走这里，免得各写一份、
+    然后 IPv6 在其中一处漏掉。
+
+    为什么 IPv6 非要方括号：地址自己就带冒号，``240e:354::1:9000``
+    根本分不清哪段是端口。方括号是 URL 里通行的写法，大家也熟悉。
+
+    ``allow_zero`` 是给**监听**地址用的：那里端口 0 表示"让系统随便挑一个"，
+    是正经用法。而连接目标写 0 没有任何意义，所以默认不接受。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    if text.startswith("["):
+        host, sep, rest = text[1:].partition("]")
+        if not sep or not host:
+            return None
+        port = _port(rest.lstrip(":"), allow_zero)
+        return (host, port) if port is not None else None
+
+    if ":" not in text:
+        return None
+    host, _, port_text = text.rpartition(":")
+    if ":" in host:
+        # 没加方括号的 IPv6，rpartition 会把地址切碎
+        return None
+    port = _port(port_text, allow_zero)
+    return (host, port) if port is not None else None
+
+
+def _port(text: str, allow_zero: bool = False) -> Optional[int]:
+    """端口号得在范围内。
+
+    不校验的话 ``host:99999`` 会一路通过，直到 socket 那里才炸 —— 报的是
+    "指定的端口无效" 之类，完全看不出是哪儿填错了。
+    """
+    try:
+        port = int(text)
+    except (TypeError, ValueError):
+        return None
+    lowest = 0 if allow_zero else 1
+    return port if lowest <= port <= 65535 else None
+
+def parse_listen_addr(text: str) -> Optional[Tuple[str, int]]:
+    """解析监听地址。允许只写端口，默认绑 127.0.0.1。
+
+    只给端口时不监听 0.0.0.0：隧道客户端一般只给自己机器上的程序连，
+    对外监听等于顺手把服务开放给整个网段，不该是默认行为。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    if ":" not in text:
+        # 只写端口的情况：0 是合法的，表示让系统挑一个
+        port = _port(text, allow_zero=True)
+        return ("127.0.0.1", port) if port is not None else None
+    return parse_addr(text, allow_zero=True)
+
 
 #: 心跳发送间隔（秒）。
 HEARTBEAT_INTERVAL = 10.0
@@ -109,13 +193,13 @@ class Link:
     def label(self) -> str:
         if self.name:
             return self.name
-        if self.addr:
-            return f"{self.addr[0]}:{self.addr[1]}"
-        return "?"
+        return self.peer_addr
 
     @property
     def peer_addr(self) -> str:
-        return f"{self.addr[0]}:{self.addr[1]}" if self.addr else "?"
+        if not self.addr:
+            return "?"
+        return format_addr(self.addr[0], self.addr[1])
 
     def close(self, reason: str = "主动关闭") -> None:
         self._shutdown(reason)
@@ -285,6 +369,26 @@ class Link:
     def __repr__(self) -> str:
         state = "alive" if self.alive else f"closed({self.close_reason})"
         return f"<Link {self.label} {state}>"
+
+
+def bind_reusable(sock: socket.socket) -> socket.socket:
+    """给监听 socket 设好地址复用选项。**Windows 上跟 POSIX 完全不是一回事。**
+
+    POSIX 的 ``SO_REUSEADDR`` 只影响 TIME_WAIT 状态的端口，好处是服务重启
+    时不会被上一个连接的残留卡住。Windows 的同名选项却是"允许别人绑我正在
+    用的端口"（hijack）—— 后果很具体：
+
+    第二个房间会**开成功**，用户看到房间号、界面上一切正常，但连接全被
+    第一个进程接走。查起来极其费劲，因为两边都没有任何报错。
+
+    所以 Windows 上改用 ``SO_EXCLUSIVEADDRUSE``，明确拒绝重复绑定 ——
+    宁可让用户看到"端口被占用"，也不要给他一个假装开好了的房间。
+    """
+    if sys.platform == "win32":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    return sock
 
 
 def connect(host: str, port: int, timeout: float = 8.0, **kwargs) -> Link:

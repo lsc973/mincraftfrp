@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -66,7 +67,10 @@ def run_cli(cli: Path, report: Report) -> None:
         [str(cli), "doctor"], capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=180, env=ENV,
     )
-    report.check("doctor 退出码为 0", proc.returncode == 0, f"rc={proc.returncode}")
+    # doctor 的退出码是有含义的：0 = 全过，1 = 有项目没通过（比如宽带在
+    # 运营商大内网里）。不能断言必须为 0 —— 那取决于跑测试的机器是什么网络。
+    report.check("doctor 正常结束（0=全过 / 1=有项目没通过）",
+                 proc.returncode in (0, 1), f"rc={proc.returncode}")
     report.check("doctor 输出中文正常", "环境自检" in proc.stdout and "本机 IP" in proc.stdout)
     report.check("doctor 无异常", "Traceback" not in (proc.stderr or ""))
     for line in proc.stdout.splitlines():
@@ -108,7 +112,40 @@ def run_cli(cli: Path, report: Report) -> None:
     for line in [l for l in host_out.splitlines() if l.strip()][-5:]:
         print("    " + line)
 
-    report.section("3. 命令行版：中继")
+    report.section("3. 命令行版：免费域名的 HTTPS")
+    # 这一段专门防"源码能跑、exe 崩"：ssl 和根证书在 PyInstaller onefile 里
+    # 最容易缺。缺了的话报的是 ModuleNotFoundError / DLL load failed，
+    # 跟网络不通是两码事 —— 所以这里要区分开，不能一律当成"网络问题"放过。
+    ddns_env = dict(ENV)
+    ddns_env["LANLINK_CONFIG_DIR"] = str(_TEMP / "lanlink-smoke-ddns")
+    setup = subprocess.run(
+        [str(cli), "ddns", "setup", "--provider", "dynv6",
+         "--hostname", "smoketest.dynv6.net", "--token", "definitely-not-a-real-token"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=120, env=ddns_env,
+    )
+    out = setup.stdout + (setup.stderr or "")
+    markers = ("No module named", "DLL load failed", "ImportError")
+    packaging_broken = any(m in out for m in markers)
+    # 出问题时把真正那一行挑出来，别甩最后一行（那是"配置已经存下来了"之类
+    # 的收尾话，对排查毫无帮助）
+    detail = ""
+    if packaging_broken:
+        for line in out.splitlines():
+            if any(m in line for m in markers):
+                detail = line.strip()[:200]
+                break
+    report.check("exe 里 ssl / 证书没缺", not packaging_broken, detail)
+    if "令牌不对" in out:
+        report.check("HTTPS 真的走通了（第三方 API 正常回话）", True)
+    elif packaging_broken:
+        pass   # 上面那条已经记下来了
+    else:
+        # 断网、被墙、服务商抽风 —— 跟打包无关，不该让 exe 验证失败
+        print("    [跳过] 这次没连上 dynv6，无法确认 HTTPS 往返（不影响打包结论）")
+    shutil.rmtree(_TEMP / "lanlink-smoke-ddns", ignore_errors=True)
+
+    report.section("4. 命令行版：中继")
     relay = subprocess.Popen(
         [str(cli), "relay", "--port", "53102", "--token", "tk"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -130,7 +167,7 @@ def run_cli(cli: Path, report: Report) -> None:
 
 
 def run_gui(gui: Path, report: Report) -> None:
-    report.section("4. 图形版：启动检查")
+    report.section("5. 图形版：启动检查")
 
     log_path = _TEMP / "lanlink.log"
     if log_path.exists():

@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .link import Link
+from .link import Link, bind_reusable
 from .node import PROTOCOL_VERSION, RELAY_ID_BASE
 from .protocol import (
     KIND_JSON,
@@ -139,7 +139,7 @@ class RelayServer:
         if self._server is not None:
             return self
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        bind_reusable(server)
         server.bind((self.bind_host, self.port))
         server.listen(64)
         self._server = server

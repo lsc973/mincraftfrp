@@ -4,9 +4,13 @@
     python -m lanlink list
     python -m lanlink join  --room 3f2a1b9c
     python -m lanlink relay --port 9000
+    python -m lanlink ddns  setup
 
 ``host`` 和 ``join`` 之后会进一个简易聊天室：直接打字回车就是广播，
 ``/w 2 内容`` 是私聊 #2，``/who`` 看有谁，``/quit`` 退出。
+
+``ddns`` 配一个免费动态域名，把本机不断变化的 IPv6 绑到一个固定的短名字上。
+开隧道时会自动更新，你只要把域名发给对方，不用每次去翻那四十个字符的地址。
 """
 
 from __future__ import annotations
@@ -21,9 +25,10 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .discovery import DISCOVERY_PORT, Scanner, scan
+from .discovery import DISCOVERY_PORT, Scanner, global_ipv6, scan
 from .node import Client, Host, PeerInfo, default_name
 from .relay import DEFAULT_RELAY_PORT, RelayServer, list_relay_rooms
+from .link import format_addr, parse_addr
 from .text import encode_text, safe_input, safe_print
 
 
@@ -46,13 +51,34 @@ def _setup_logging(verbose: bool, level: Optional[str] = None) -> None:
 
 
 def _parse_addr(text: str) -> tuple:
+    """argparse 用的地址解析，实际逻辑在 link.parse_addr。
+
+    这里只负责把 None 变成 argparse 能显示的错误。
+    """
+    parsed = parse_addr(text)
+    if parsed is None:
+        raise argparse.ArgumentTypeError(
+            "地址要写成 host:端口，比如 192.168.1.10:50001；"
+            "IPv6 要加方括号，比如 [240e:354::1]:50001"
+        )
+    return parsed
+
+
+def _parse_listen(text: str) -> tuple:
+    """监听地址。允许只写端口，默认绑 127.0.0.1。
+
+    只给端口的话默认不对外暴露 —— 隧道客户端一般只给自己机器上的程序连，
+    监听 0.0.0.0 等于顺手把服务开放给同网段所有人，不该是默认行为。
+    """
+    text = text.strip()
     if ":" not in text:
-        raise argparse.ArgumentTypeError("地址要写成 host:port，比如 1.2.3.4:9000")
-    host, _, port = text.rpartition(":")
-    try:
-        return host, int(port)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"端口不是数字：{port!r}")
+        try:
+            return ("127.0.0.1", int(text))
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"要么写端口（如 25565），要么写 地址:端口（如 0.0.0.0:25565），收到 {text!r}"
+            )
+    return _parse_addr(text)
 
 
 # ------------------------------------------------------------------ 聊天循环
@@ -376,6 +402,401 @@ def cmd_relay(args) -> int:
     return 0
 
 
+def cmd_tunnel(args) -> int:
+    """端口转发隧道：把房间当成一条虚拟网线。
+
+    ``--to`` 那侧是有服务的那台，``--listen`` 那侧是想连过来的那台。
+    """
+    from . import server as servercfg
+    from .tunnel import Tunnel, TunnelError, check_room, share_text
+
+    if bool(args.to) == bool(args.listen):
+        print("必须二选一：--to <服务地址>（服务在这边）"
+              "或 --listen <端口>（服务在对面）", file=sys.stderr)
+        return 2
+
+    is_server = args.to is not None
+    nickname = args.name or default_name()
+
+    # 房间名在这些情况下用不到：服务端（房间名就是它自己起的）、
+    # 客户端且直接填了对方地址。只有"走中继"和"局域网按名字搜"才必须给。
+    needs_room = (not is_server) and not args.addr
+    if needs_room and not args.room:
+        print("客户端要么用 --room <房间名> 搜局域网，"
+              "要么用 --addr <地址> 直接连，要么用 --relay 走中继", file=sys.stderr)
+        return 2
+
+    # ---- 先把本地这头准备好，再去连房间 ----
+    tunnel = None
+    node = None
+    try:
+        if is_server:
+            node = Host(
+                args.room or "tunnel",
+                name=f"{nickname} #tunnel",
+                port=args.port,
+                advertise=not args.no_advertise,
+                discovery_port=args.discovery_port,
+                password=args.password or "",
+                max_players=args.max_players,
+            ).start()
+            print(f"房间已创建：{node.room_name}（房间号 {node.room_id}）")
+            print(f"局域网地址：{format_addr(node.address, node.port)}")
+            relay_arg = None
+            room_arg = None
+            if args.relay:
+                host, port = args.relay
+                room_arg = args.room or node.room_id
+                node.attach_relay(host, port, room_id=room_arg,
+                                  token=args.relay_token or "")
+                relay_arg = format_addr(host, port)
+                print(f"已挂中继：{relay_arg}   房间号 {room_arg}")
+
+            # 把"该发给对方什么"整段打出来。IPv6 地址四十个字符，让用户自己
+            # 去翻、去念给对面听是不现实的 —— 整段复制粘到微信里发过去即可。
+            #
+            # 建议对方监听的端口用**服务端口**（25565），不是这边的房间端口。
+            # 房间端口是随机分配的，让对方去连个 54003 既没道理也容易看错。
+            print()
+            listen_hint = args.to[1]
+            if relay_arg is not None:
+                print(share_text(listen=listen_hint, password=args.password or "",
+                                 relay=relay_arg, room=room_arg))
+            elif servercfg.resolve() is not None:
+                # 地址已经编进对方的 exe 了（或者他自己配过），所以对方只要
+                # 房间号 + 口令。这里的房间号就是本机的 room_id。
+                print(share_text(listen=listen_hint, password=args.password or "",
+                                 room=node.room_id, server_default=True))
+            else:
+                v6 = global_ipv6()
+                share_host = _publish_ddns(v6)
+                if share_host is None and v6 is None:
+                    print("注意：没检测到全球 IPv6，下面这个局域网地址出了这个网段就没人连得上。")
+                print(share_text(
+                    address=format_addr(share_host or v6 or node.address, node.port),
+                    listen=listen_hint, password=args.password or "",
+                ))
+        else:
+            # 没给地址时用它。地址可能是打包时编进 exe 的，也可能是配置里设的。
+            default_server = servercfg.resolve()
+            if args.relay:
+                host, port = args.relay
+                if not args.room:
+                    print("走中继时必须用 --room 指定房间号", file=sys.stderr)
+                    return 2
+                node = Client.join_via_relay(
+                    host, port, args.room, name=f"{nickname} #tunnel",
+                    password=args.password or "", token=args.relay_token or "",
+                )
+            elif args.addr:
+                # 直接连指定地址。用于这两种"搜不到"的情况：
+                #   1. 装了 Tailscale / ZeroTier 之类的虚拟局域网 —— 填对方虚拟 IP
+                #   2. 对方有公网 IP 并做了端口映射 —— 填公网地址
+                # 这两种都不需要中继。
+                node = Client.connect(args.addr[0], args.addr[1],
+                                      name=f"{nickname} #tunnel",
+                                      password=args.password or "")
+                check_room(node, args.room)
+            elif default_server is not None:
+                # 地址是编在 exe 里 / 配置里设好的，用户只给了房间号和口令
+                host, port = default_server
+                print(f"正在连接 {format_addr(host, port)} …")
+                node = Client.connect(host, port, name=f"{nickname} #tunnel",
+                                      password=args.password or "")
+                check_room(node, args.room)
+            else:
+                print(f"正在局域网里找房间「{args.room}」…")
+                info = _find_room(args.room, args.discovery_port, args.timeout)
+                if info is None:
+                    print(f"没找到房间「{args.room}」。", file=sys.stderr)
+                    print("  服务端起了吗？不在同一网段的话，两条路：", file=sys.stderr)
+                    print("    · 装了 Tailscale / ZeroTier 之类的虚拟局域网"
+                          " → 用 --addr <对方的虚拟IP>:<端口>", file=sys.stderr)
+                    print("    · 有公网 IP 并做了端口映射 → 用 --addr <公网地址>", file=sys.stderr)
+                    print("    · 都没有 → 得用中继（--relay）", file=sys.stderr)
+                    return 1
+                node = Client.connect(info.address, info.port,
+                                      name=f"{nickname} #tunnel",
+                                      password=args.password or "")
+            print(f"已加入房间，我是 #{node.peer_id}")
+
+        # ---- 建隧道 ----
+        if is_server:
+            target_host, target_port = args.to
+            tunnel = Tunnel(node, role="server", target=(target_host, target_port)).start()
+            print()
+            print("=" * 58)
+            print("  隧道已就绪（服务端）")
+            print(f"  把流量转发到：{target_host}:{target_port}")
+            print("=" * 58)
+        else:
+            bind_host, bind_port = args.listen
+            tunnel = Tunnel(node, role="client", listen=(bind_host, bind_port)).start()
+            print()
+            print("=" * 58)
+            print(f"  隧道已就绪（客户端）")
+            print(f"  本机监听：{bind_host}:{bind_port}")
+            print(f"  把要连的程序指向这个地址即可")
+            print("=" * 58)
+    except TunnelError as exc:
+        print(f"隧道建立失败：{exc}", file=sys.stderr)
+        if node is not None:
+            node.close()
+        return 1
+    except Exception as exc:
+        print(f"出错了：{exc}", file=sys.stderr)
+        if node is not None:
+            node.close()
+        return 1
+
+    print("  Ctrl+C 或 SIGTERM 退出")
+    print()
+
+    stop = threading.Event()
+
+    def on_signal(signum, _frame):
+        print(f"\n收到信号 {signum}，正在关闭…", flush=True)
+        stop.set()
+
+    for signame in ("SIGTERM", "SIGINT", "SIGBREAK"):
+        sig = getattr(signal, signame, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, on_signal)
+        except (ValueError, OSError):
+            pass
+
+    last_report = time.monotonic()
+    last_up = last_down = 0
+    try:
+        while not stop.is_set():
+            # 跟 relay 一个道理：用 time.sleep 而不是 Event.wait，
+            # 后者在 Windows 上要等整个超时才处理信号。
+            time.sleep(0.5)
+            if stop.is_set():
+                break
+            now = time.monotonic()
+            if now - last_report >= 30.0:
+                last_report = now
+                stats = tunnel.stats()
+                up = stats["up"] - last_up
+                down = stats["down"] - last_down
+                last_up, last_down = stats["up"], stats["down"]
+                if stats["streams"] or up or down:
+                    print(
+                        f"  [隧道] 活跃流 {stats['streams']}    "
+                        f"上行 {up / 1024:.1f} KB/30s  下行 {down / 1024:.1f} KB/30s",
+                        flush=True,
+                    )
+    except KeyboardInterrupt:
+        print("\n正在关闭…", flush=True)
+    finally:
+        tunnel.close()
+        node.close()
+        total = tunnel.stats()
+        print(f"已停止。累计上行 {total['up'] / 1024:.1f} KB / 下行 {total['down'] / 1024:.1f} KB",
+              flush=True)
+    return 0
+
+
+def cmd_server(args) -> int:
+    """默认服务器地址 —— 也就是"对面要连哪儿"。"""
+    from . import server
+
+    action = getattr(args, "server_action", None) or "show"
+
+    if action == "set":
+        try:
+            address = server.save(args.address)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(f"好了，对面现在只要填房间号和口令就能连到 {format_addr(*address)}。")
+        print(f"（存在 {server.config.config_path()}；打包时也可以用 --server 直接编进 exe）")
+        return 0
+
+    if action == "clear":
+        if server.clear():
+            print("已删掉配置文件里的服务器地址。")
+        else:
+            print("配置文件里本来就没设。")
+        from_build = server.baked()
+        if from_build is not None:
+            print(f"注意：打包时编进 exe 的 {format_addr(*from_build)} 还在，会重新生效。")
+        return 0
+
+    print(server.describe())
+    return 0
+
+
+def _publish_ddns(address) -> "str | None":
+    """开隧道时顺手把域名指过来。返回域名，没配或者失败都返回 None。
+
+    **失败绝不能挡住隧道启动** —— 域名只是个方便，隧道本身用 IP 照样能用。
+    所以这里把异常全吃掉，只打一行提示。
+    """
+    from . import ddns
+
+    config = ddns.load()
+    if config is None or not address:
+        return None
+
+    print(f"正在更新域名 {config.hostname} …")
+    try:
+        ddns.publish(address, config)
+    except ddns.DdnsError as exc:
+        print(f"域名更新失败：{exc}")
+        print("  这次直接用 IP 地址，对方照样连得上。修好之后跑 lanlink ddns update 重试。")
+        return None
+    except Exception as exc:  # pragma: no cover - 兜底，同样不能挡住隧道
+        print(f"域名更新失败：{exc}")
+        return None
+
+    if not ddns.verify(config.hostname, address, attempts=3, interval=1.0):
+        # 请求成功了但本机 DNS 还没跟上，对面多半已经能解析到。照实说，
+        # 别吓得用户以为白配了。
+        print(f"（{config.hostname} 的更新已提交，本机 DNS 还没跟上，这个不影响对方）")
+    return config.hostname
+
+
+def cmd_ddns(args) -> int:
+    """免费动态域名：用一个短名字代替那一长串 IPv6。"""
+    from . import ddns
+
+    action = getattr(args, "ddns_action", None) or "show"
+
+    if action == "clear":
+        if ddns.clear():
+            print("已删掉免费域名配置。")
+        else:
+            print("本来就没配过。")
+        return 0
+
+    if action == "show":
+        return _ddns_show(ddns)
+
+    if action == "setup":
+        return _ddns_setup(ddns, args)
+
+    if action == "update":
+        config = ddns.load()
+        if config is None:
+            print("还没配置免费域名。先跑一次：lanlink ddns setup", file=sys.stderr)
+            return 2
+        address = global_ipv6()
+        if not address:
+            print("本机没有全球可达的 IPv6 地址，没有可以发布的东西。", file=sys.stderr)
+            print("  跑 lanlink doctor 看看网络情况。", file=sys.stderr)
+            return 1
+        print(f"正在把 {config.hostname} 指向 {address} …")
+        try:
+            ddns.publish(address, config)
+        except ddns.DdnsError as exc:
+            print(f"更新失败：{exc}", file=sys.stderr)
+            return 1
+        if ddns.verify(config.hostname, address):
+            print(f"好了。{config.hostname} 现在指向 {address}")
+        else:
+            # 更新请求本身成功了，只是本机 DNS 还没跟上。别把它说成失败 ——
+            # 对面多半已经能解析到了。
+            print(f"更新请求已提交，但本机 DNS 还没解析到 {address}。")
+            print("  这通常是本机 DNS 缓存还没过期，等一两分钟；不影响对面。")
+        return 0
+
+    return 2
+
+
+def _ddns_show(ddns) -> int:
+    config = ddns.load()
+    path = ddns.config_path()
+    if config is None:
+        print("还没配置免费域名。")
+        print()
+        print("配了之后，你就有个固定的短名字，不用再每次把那一长串 IPv6 发给对方：")
+        print("  lanlink ddns setup")
+        print()
+        print(ddns.describe_setup())
+        return 0
+
+    print(f"服务商：{config.label}")
+    print(f"域名：  {config.hostname}")
+    print(f"令牌：  已保存（{len(config.token)} 个字符，不回显）")
+    print(f"配置：  {path}")
+
+    address = global_ipv6()
+    print()
+    if not address:
+        print("本机当前没有全球可达的 IPv6 —— 域名暂时指不过来。")
+        return 0
+    print(f"本机 IPv6：{address}")
+    found = ddns.resolve(config.hostname)
+    if found is None:
+        print(f"{config.hostname} 解析不到 —— 可能还没更新过，或者刚配好还没生效。")
+        print("  跑 lanlink ddns update 更新一下。")
+    elif ddns._same_address(found, address):
+        print(f"{config.hostname} → {found}（对得上）")
+    else:
+        print(f"{config.hostname} → {found}（跟本机地址对不上，跑一次 lanlink ddns update）")
+    return 0
+
+
+def _ddns_setup(ddns, args) -> int:
+    provider = (getattr(args, "provider", None) or "").strip().lower()
+    hostname = (getattr(args, "hostname", None) or "").strip()
+    token = (getattr(args, "token", None) or "").strip()
+
+    if not provider:
+        print("先选一家免费动态域名服务商：")
+        for key, item in ddns.PROVIDERS.items():
+            print(f"  {key:<8} {item.label}　例：{item.example}")
+        print()
+        print(ddns.describe_setup())
+        print()
+        provider = safe_input(f"服务商（回车默认 {ddns.DEFAULT_PROVIDER}）：").strip()
+        provider = provider.lower() or ddns.DEFAULT_PROVIDER
+    if provider not in ddns.PROVIDERS:
+        print(f"不认识的服务商：{provider}", file=sys.stderr)
+        return 2
+
+    if not hostname:
+        example = ddns.PROVIDERS[provider].example
+        hostname = safe_input(f"你申请到的域名（例：{example}）：").strip()
+    if not token:
+        token = safe_input("token / 密钥：").strip()
+
+    try:
+        path = ddns.save(ddns.DdnsConfig(provider, hostname, token))
+    except ddns.DdnsError as exc:
+        print(f"配置有问题：{exc}", file=sys.stderr)
+        return 2
+
+    print(f"已保存到 {path}")
+    print("（这个文件里有你的令牌，等同于域名的写权限，别发给别人）")
+    print()
+
+    address = global_ipv6()
+    if not address:
+        print("本机现在没有全球可达的 IPv6，等你有了再跑 lanlink ddns update。")
+        return 0
+    print(f"正在把 {hostname} 指向 {address} …")
+    try:
+        ddns.publish(address, ddns.load())
+    except ddns.DdnsError as exc:
+        print(f"更新失败：{exc}", file=sys.stderr)
+        print("配置已经存下来了，改好之后可以直接跑 lanlink ddns update 重试。", file=sys.stderr)
+        return 1
+
+    if ddns.verify(hostname, address):
+        print(f"成功。{hostname} 现在指向 {address}")
+    else:
+        print(f"更新请求已提交，但本机 DNS 还没解析到。等一两分钟再看。")
+    print()
+    print("以后开隧道的时候会自动更新，你只要把域名发给对方就行：")
+    print(f"  {hostname}")
+    return 0
+
+
 def cmd_doctor(args) -> int:
     from .doctor import main as doctor_main
 
@@ -440,6 +861,35 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("gui", help="打开图形界面")
     p.set_defaults(func=cmd_gui)
 
+    # tunnel
+    p = sub.add_parser(
+        "tunnel",
+        help="端口转发隧道：让不在同一局域网的人连上你本机的服务",
+        description=(
+            "把房间当成一条虚拟网线，任意 TCP 服务都能穿过去。\n"
+            "服务在哪台机器上，就在哪台机器上用 --to。"
+        ),
+    )
+    p.add_argument("--room", help="房间名（局域网模式）/ 中继上的房间号（中继模式）")
+    p.add_argument("--addr", type=_parse_addr,
+                   help="客户端：直接连这个地址，跳过局域网搜索。"
+                        "装了虚拟局域网（Tailscale/ZeroTier）或对方有公网 IP 时用")
+    p.add_argument("--to", type=_parse_addr,
+                   help="服务端：本地服务的地址，比如 127.0.0.1:25565")
+    p.add_argument("--listen", type=_parse_listen, metavar="[地址:]端口",
+                   help="客户端：本地监听的地址，比如 127.0.0.1:25565 或 25565")
+    p.add_argument("--name", help="你的昵称")
+    p.add_argument("--password", help="房间密码")
+    p.add_argument("--port", type=int, default=0, help="服务端监听端口，0 = 自动")
+    p.add_argument("--no-advertise", action="store_true",
+                   help="不在局域网广播房间（只能靠地址直连）")
+    p.add_argument("--discovery-port", type=int, default=DISCOVERY_PORT)
+    p.add_argument("--timeout", type=float, default=4.0, help="搜索房间的时长（秒）")
+    p.add_argument("--max-players", type=int, default=16)
+    p.add_argument("--relay", type=_parse_addr, help="走公网中继，格式 host:port")
+    p.add_argument("--relay-token", help="中继口令")
+    p.set_defaults(func=cmd_tunnel)
+
     # relay
     p = sub.add_parser("relay", help="跑一台公网中继服务器")
     p.add_argument("--bind", default="0.0.0.0", help="绑定地址")
@@ -456,6 +906,63 @@ def build_parser() -> argparse.ArgumentParser:
         help="日志级别，默认 INFO（房间上下线、客户端进出都会记到 stderr）",
     )
     p.set_defaults(func=cmd_relay)
+
+    # ddns
+    p = sub.add_parser(
+        "ddns",
+        help="配置免费动态域名（用一个短名字代替那一长串 IPv6）",
+        description=(
+            "把本机不断变化的 IPv6 绑定到一个固定的短域名上。\n"
+            "配好之后开隧道会自动更新，你只要把域名发给对方就行，\n"
+            "不用再每次去翻 IP，对方也不用记那一长串地址。\n\n"
+            "不带子命令时显示当前配置。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ddns_sub = p.add_subparsers(dest="ddns_action")
+
+    d = ddns_sub.add_parser("show", help="看看现在配的是什么（默认）")
+    d.set_defaults(func=cmd_ddns)
+
+    d = ddns_sub.add_parser("setup", help="配置域名（不带参数就一步步问）")
+    d.add_argument("--provider", choices=["dynv6", "duckdns"], help="服务商")
+    d.add_argument("--hostname", help="申请到的域名，如 yourname.dynv6.net")
+    d.add_argument("--token", help="服务商给的 token（等同于域名的写权限，注意别泄露）")
+    d.set_defaults(func=cmd_ddns)
+
+    d = ddns_sub.add_parser("update", help="立刻把域名指向本机当前的 IPv6")
+    d.set_defaults(func=cmd_ddns)
+
+    d = ddns_sub.add_parser("clear", help="删掉配置")
+    d.set_defaults(func=cmd_ddns)
+
+    p.set_defaults(func=cmd_ddns, ddns_action="show")
+
+    # server
+    p = sub.add_parser(
+        "server",
+        help="设置默认服务器地址（让对面只填房间号和口令）",
+        description=(
+            "设好之后，对面开隧道时只要填房间号和口令，不用知道地址。\n\n"
+            "想让**对面**也省事，打包时加 --server 把地址直接编进 exe：\n"
+            "  python packaging/build.py --mode all --server yourname.dynv6.net:50001\n"
+            "把打出来的 exe 发给他，他就什么地址都不用填了。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    server_sub = p.add_subparsers(dest="server_action")
+
+    s = server_sub.add_parser("show", help="看看现在用的是哪个地址（默认）")
+    s.set_defaults(func=cmd_server)
+
+    s = server_sub.add_parser("set", help="设置地址")
+    s.add_argument("address", help="host:端口，如 yourname.dynv6.net:50001")
+    s.set_defaults(func=cmd_server)
+
+    s = server_sub.add_parser("clear", help="删掉（打包时编进去的会重新生效）")
+    s.set_defaults(func=cmd_server)
+
+    p.set_defaults(func=cmd_server, server_action="show")
 
     return parser
 

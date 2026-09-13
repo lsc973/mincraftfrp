@@ -26,12 +26,24 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DIST = PROJECT_ROOT / "dist"
 BUILD = PROJECT_ROOT / "build"
 
+# 让这个脚本能 import lanlink。`python packaging/build.py` 时 sys.path[0] 是
+# packaging/ 而不是项目根目录，不插这一下的话 import lanlink 直接 ModuleNotFoundError。
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 #: 打包时故意不带的模块。能把体积压下来一截，而且这些我们确实一个都没用。
 _EXCLUDES = [
     "numpy", "pandas", "matplotlib", "scipy", "PIL", "PyQt5", "PySide2",
     "pytest", "setuptools", "pip", "unittest", "pydoc", "doctest",
-    "email", "html", "http.server", "xmlrpc", "sqlite3", "distutils",
+    "html", "http.server", "xmlrpc", "sqlite3", "distutils",
 ]
+
+# 注意：**不要把 email 加进来**。它看着像是用不上的重家伙，但
+# http.client 依赖它（import email.parser / email.message），
+# 而 UPnP 要用 http.client 去调路由器。
+#
+# 这个坑很阴：排除了之后源码跑得好好的、245 个测试全过，
+# 只有打包出来的 exe 一调 doctor 就崩 —— 所以 exe 冒烟测试不能省。
 
 MODES = {
     "gui": {
@@ -130,6 +142,48 @@ def cleanup_project() -> None:
             pass
 
 
+_DEFAULTS_TEMPLATE = '''"""打包时写进去的默认值。
+
+**这个文件是 ``packaging/build.py`` 自动生成的，别手改** —— 下次打包就覆盖了。
+源码运行时的值就是下面这些空值。
+
+为什么要把服务器地址编进 exe：对面拿到 exe 之后，只要填房间号和口令就能连，
+不用知道也不需要填任何地址。地址是给谁用的、怎么改，见 ``lanlink/server.py``。
+"""
+
+#: 默认服务器地址，形如 "yourname.dynv6.net:50001"。空表示没编进去。
+DEFAULT_SERVER = {server}
+
+#: 打包这个 exe 时用的说明，显示给用户看（比如"这是给小明的那份"）。
+LABEL = {label}
+'''
+
+
+def write_build_defaults(server: str, label: str) -> None:
+    """把默认值写进 lanlink/_build_defaults.py。
+
+    每次打包都重写（没给 --server 就写空），这样"打出来的 exe 里到底是什么"
+    永远等于这次命令行的参数，不会残留上一次的。残留过一次就很难查：
+    exe 里的地址跟上一次打包的一样，看着像根本没生效。
+    """
+    server = (server or "").strip()
+    if server:
+        # 在这里就校验，别等打包跑完几分钟才因为地址写错白忙一场
+        from lanlink.link import parse_addr
+
+        if parse_addr(server) is None:
+            raise ValueError(
+                f"--server 格式不对：{server!r}。应该是 host:端口，"
+                f"比如 yourname.dynv6.net:50001；IPv6 要加方括号，比如 [240e::1]:50001。"
+            )
+
+    target = Path(__file__).resolve().parent.parent / "lanlink" / "_build_defaults.py"
+    target.write_text(
+        _DEFAULTS_TEMPLATE.format(server=repr(server), label=repr((label or "").strip())),
+        encoding="utf-8",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="把 lanlink 打包成 exe")
     parser.add_argument(
@@ -137,10 +191,26 @@ def main() -> int:
         help="打包哪个（both = gui+cli，all = 全部）",
     )
     parser.add_argument("--clean", action="store_true", help="打包前清掉缓存")
+    parser.add_argument(
+        "--server",
+        help="把默认服务器地址编进 exe（如 yourname.dynv6.net:50001）。"
+             "编了之后对面只要填房间号和口令就能连，不用知道地址。",
+    )
+    parser.add_argument("--label", help="这份 exe 是给谁的，显示在界面上（如「给小明的」）")
     args = parser.parse_args()
+
+    try:
+        write_build_defaults(args.server or "", args.label or "")
+    except ValueError as exc:
+        print(f"参数有问题：{exc}", file=sys.stderr)
+        return 2
 
     version = check_pyinstaller()
     print(f"Python {sys.version.split()[0]} / PyInstaller {version}")
+    if args.server:
+        print(f"默认服务器地址：{args.server}")
+    else:
+        print("默认服务器地址：没编（对面需要自己填地址，或者靠局域网搜索）")
 
     if args.mode == "both":
         modes = ["gui", "cli"]

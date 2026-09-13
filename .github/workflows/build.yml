@@ -1,0 +1,107 @@
+name: 打包 exe
+
+# 怎么用：
+#
+#   手动出包（最常用）
+#     仓库页面 → Actions → 左边选「打包 exe」→ Run workflow
+#     填上服务器地址和"给谁的"，跑完在页面底部下载 zip
+#
+#   打标签自动出包
+#     git tag v1.0 && git push --tags
+#     跑完会挂在 Release 里
+#
+# 为什么必须是 Windows 机器：PyInstaller 不能交叉编译，Linux 上打不出 exe。
+
+on:
+  workflow_dispatch:
+    inputs:
+      server:
+        description: '默认服务器地址（host:端口）。填了对面就只要房间号+口令；留空则对面要自己填地址'
+        required: false
+        default: ''
+      label:
+        description: '这份 exe 是给谁的（会写进 zip 文件名和里面的说明）'
+        required: false
+        default: ''
+      with_cli:
+        description: '把命令行版也打进 zip'
+        type: boolean
+        required: false
+        default: false
+
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # 打标签时要把产物挂到 Release 上
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 装 PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      # 先跑测试。打一个跑不起来的包比不打包更糟 —— 对面拿到手才发现问题，
+      # 而这边还得重新走一遍发文件的流程。
+      - name: 跑测试
+        run: python -m unittest discover -s tests -q
+        env:
+          PYTHONIOENCODING: utf-8
+
+      - name: 打包
+        shell: bash
+        run: |
+          python packaging/build.py --mode all \
+            --server "${{ inputs.server }}" \
+            --label "${{ inputs.label }}"
+
+      # 打包成功不等于能跑。PyInstaller 经常打出一个双击就闪退的东西，
+      # 所以这里把 exe 当黑盒完整跑一遍（开房/加入/收发/中继/HTTPS）。
+      - name: 验证 exe（命令行版）
+        run: python tools/exe_smoke_test.py --skip-gui
+        env:
+          PYTHONIOENCODING: utf-8
+
+      # 图形版单独跑，而且**不因为它挂掉就中断整个构建**。
+      # CI 机器上没有交互式桌面，"窗口标题"这类检查天生不稳；
+      # 但完全不查又不行 —— 失败了会在这行看到红叉，去翻日志即可。
+      - name: 验证 exe（图形版，仅供参考）
+        continue-on-error: true
+        run: python tools/exe_smoke_test.py
+        env:
+          PYTHONIOENCODING: utf-8
+
+      - name: 收拾成可以发给对面的 zip
+        shell: bash
+        run: |
+          ARGS="--label \"${{ inputs.label }}\""
+          if [ "${{ inputs.with_cli }}" = "true" ]; then ARGS="$ARGS --with-cli"; fi
+          python tools/make_release.py $ARGS --out release
+
+      - name: 列出产物
+        shell: bash
+        run: ls -lh release/ dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lanlink-${{ inputs.label || 'build' }}
+          path: release/*.zip
+          if-no-files-found: error
+
+      # 打标签时额外挂一份到 Release，方便直接发给别人
+      - name: 挂到 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.zip
+          generate_release_notes: true

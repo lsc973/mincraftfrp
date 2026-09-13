@@ -48,6 +48,7 @@ from .node import (
     default_name,
 )
 from .protocol import ProtocolError
+from .tunnel import Tunnel, TunnelError
 from .relay import DEFAULT_RELAY_PORT, RelayRoomInfo, RelayServer, list_relay_rooms
 
 __version__ = "0.1.0"
@@ -70,6 +71,8 @@ __all__ = [
     "Link",
     "LinkClosed",
     "ProtocolError",
+    "Tunnel",
+    "TunnelError",
     "connect",
     "default_name",
     "local_ip",

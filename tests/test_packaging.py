@@ -212,6 +212,28 @@ class TestBuildScript(unittest.TestCase):
         for module in ("numpy", "PyQt5", "matplotlib"):
             self.assertIn(f'"{module}"', self.text)
 
+    def test_does_not_exclude_email(self):
+        """email 不能被排除 —— http.client 依赖它，而 UPnP 要用 http.client。
+
+        这个坑很阴：排除了之后源码跑得好好的、两百多个测试全过，
+        只有打包出来的 exe 一调 doctor 就崩。所以这里钉死。
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "_build_under_test", ROOT / "packaging" / "build.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertNotIn(
+            "email", module._EXCLUDES,
+            "email 被排除了，但 http.client（UPnP 依赖）需要它 —— "
+            "源码测试发现不了，只有 exe 会崩",
+        )
+        # 顺便确认真的是 UPnP 需要的那条链
+        self.assertIn("http.client", (ROOT / "lanlink" / "upnp.py").read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

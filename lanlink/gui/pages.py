@@ -50,8 +50,15 @@ class StartPage(ttk.Frame):
             ("创建房间（当房主）", app.open_create_room, "Big.TButton"),
             ("加入房间", app.open_join_room, "Big.TButton"),
             ("我当中继服务器", app.open_relay, "Big.TButton"),
+            ("端口转发隧道", app.open_tunnel, "Big.TButton"),
         ):
             ttk.Button(self, text=text, command=command, style=style, width=24).pack(pady=6)
+
+        ttk.Label(
+            self,
+            text="隧道 = 把房间当成一根网线，让异地的人连上你本机的现有服务",
+            style="Hint.TLabel",
+        ).pack(pady=(10, 0))
 
         ttk.Separator(self).pack(fill="x", pady=20)
         ttk.Button(self, text="环境自检（连不上先点这里）", command=app.run_doctor).pack()
@@ -274,15 +281,33 @@ class RoomPage(ttk.Frame):
             node.kick(peer_id)
 
     def _copy_room_id(self) -> None:
+        """复制"别人加入时要填的那个号"。
+
+        挂了中继的时候，异地的人要填的是**中继房间号**，不是本机房间号 ——
+        两个号可以不一样（创建房间时能自定义中继房间号）。以前这里无条件
+        复制的本机号，主人一自定义，发给朋友的号就是错的。
+        """
         node = self.app.node
         if node is None:
             return
-        room_id = node.room_id if self.is_host else getattr(node.room, "room_id", "")
+
+        relay = getattr(node, "relay", None)
+        if self.is_host and relay is not None and relay.room_id:
+            room_id, where = relay.room_id, "中继房间号"
+        elif self.is_host:
+            room_id, where = node.room_id, "房间号"
+        else:
+            room_id = getattr(node.room, "room_id", "")
+            where = "房间号"
+            if not room_id:
+                # 客户端自己就是经中继进来的，用自己看到的那个号
+                room_id = getattr(node.room, "relay_room", "") or ""
         if not room_id:
             return
+
         self.clipboard_clear()
         self.clipboard_append(room_id)
-        self.app.set_status(f"房间号 {room_id} 已复制到剪贴板")
+        self.app.set_status(f"{where} {room_id} 已复制到剪贴板")
 
 
 # ====================================================================== 中继页
@@ -417,6 +442,7 @@ class DoctorDialog(tk.Toplevel):
 
     def __init__(self, master: tk.Misc, app) -> None:
         super().__init__(master)
+        self.app = app
         self.title("环境自检")
         self.geometry("620x460")
         self.transient(master)
@@ -445,7 +471,9 @@ class DoctorDialog(tk.Toplevel):
         except Exception as exc:  # 自检本身出错也要显示出来，不能白屏
             report = f"自检执行失败：{type(exc).__name__}: {exc}"
             marks = []
-        self.after(0, lambda: self._show(report, marks))
+        # 必须走 app.post 回主线程。self.after() 也是 Tcl 调用，
+        # 在后台线程里调同样会抛 "main thread is not in main loop"。
+        self.app.post(self._show, report, marks)
 
     def _show(self, report: str, marks) -> None:
         self.text.configure(state="normal")

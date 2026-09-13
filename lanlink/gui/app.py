@@ -13,6 +13,7 @@ tkinter 只能在主线程里碰。而网络事件全都来自后台线程 —�
 
 from __future__ import annotations
 
+import logging
 import queue
 import sys
 import threading
@@ -23,9 +24,12 @@ from typing import Callable, Optional
 from ..discovery import Scanner
 from ..node import Client, Host, default_name
 from .pages import DoctorDialog, RelayPage, RoomPage, StartPage
+from .tunnel_page import TunnelPage
 from .widgets import RoomList, apply_theme, enable_dpi_awareness, pick_ui_font
 
 __all__ = ["LanlinkApp", "main"]
+
+log = logging.getLogger("lanlink.gui")
 
 #: 界面刷新间隔。40ms ≈ 25fps，人眼看不出延迟，也不会空转烧 CPU。
 _UI_POLL_MS = 40
@@ -68,6 +72,7 @@ class LanlinkApp(tk.Tk):
             ("start", lambda: StartPage(container, self)),
             ("room", lambda: RoomPage(container, self)),
             ("relay", lambda: RelayPage(container, self)),
+            ("tunnel", lambda: TunnelPage(container, self)),
         ):
             frame = factory()
             frame.grid(row=0, column=0, sticky="nsew")
@@ -83,10 +88,29 @@ class LanlinkApp(tk.Tk):
         current = self.pages.get(name)
         if current is None:
             return
-        # 离开中继页时把服务器停掉，免得后台还在监听
-        relay_page = self.pages.get("relay")
-        if name != "relay" and isinstance(relay_page, RelayPage):
-            relay_page.on_leave()
+        # 有些页面会在后台跑东西（中继服务、隧道）。切走时必须收摊，
+        # 否则会留下一个用户看不见、也关不掉的监听端口。
+        # 约定：页面实现 on_leave() 就会被自动调用。
+        for page_name, page in self.pages.items():
+            if page_name == name:
+                continue
+            on_leave = getattr(page, "on_leave", None)
+            if callable(on_leave):
+                try:
+                    on_leave()
+                except Exception as exc:
+                    log.warning("页面 %s 收尾时出错：%s", page_name, exc)
+
+        # on_leave 的对偶：页面被切回来时刷新一次。配置可能在别处被改过
+        # （命令行 `lanlink server set`、设置对话框……），切回来还显示旧值
+        # 会让人以为没生效。
+        on_show = getattr(current, "on_show", None)
+        if callable(on_show):
+            try:
+                on_show()
+            except Exception as exc:
+                log.warning("页面 %s 刷新时出错：%s", name, exc)
+
         current.tkraise()
 
     def set_status(self, text: str) -> None:
@@ -217,6 +241,9 @@ class LanlinkApp(tk.Tk):
     def open_relay(self) -> None:
         self.show_page("relay")
 
+    def open_tunnel(self) -> None:
+        self.show_page("tunnel")
+
     def run_doctor(self) -> None:
         DoctorDialog(self, self)
 
@@ -257,9 +284,13 @@ class LanlinkApp(tk.Tk):
         if self._scanner is not None:
             self._scanner.stop()
             self._scanner = None
-        relay_page = self.pages.get("relay")
-        if isinstance(relay_page, RelayPage):
-            relay_page.on_leave()
+        for page in self.pages.values():
+            on_leave = getattr(page, "on_leave", None)
+            if callable(on_leave):
+                try:
+                    on_leave()
+                except Exception:
+                    pass
         if self.node is not None:
             try:
                 self.node.close()
@@ -306,17 +337,24 @@ class CreateRoomDialog(tk.Toplevel):
         self.relay_addr = tk.StringVar()
         self.relay_room = tk.StringVar()
         self.relay_token = tk.StringVar()
+        # 「中继房间号」是可选的：留空就用本机自动生成的那个房间号。
+        # 标签必须把"可留空"写出来 —— 放在"创建房间"对话框里、只写"房间号"，
+        # 会让人以为创建房间还得自己编一个号。
         self._relay_rows = [
             ("中继地址", ttk.Entry(body, textvariable=self.relay_addr, width=30)),
             ("中继房间号", ttk.Entry(body, textvariable=self.relay_room, width=30)),
             ("中继口令", ttk.Entry(body, textvariable=self.relay_token, width=30, show="•")),
         ]
-        for index, (label, widget) in enumerate(self._relay_rows):
+        labels = ["中继地址", "中继房间号（可留空）", "中继口令"]
+        for index, ((_default, widget), label) in enumerate(zip(self._relay_rows, labels)):
             self._row(body, 6 + index, label, widget)
-        ttk.Label(
-            body, text="中继地址格式 host:端口，比如 1.2.3.4:9000；房间号留空则用本机房间号。",
-            style="Hint.TLabel",
-        ).grid(row=9, column=1, sticky="w")
+        self._relay_hint = ttk.Label(
+            body,
+            text="中继地址格式 host:端口，比如 1.2.3.4:9000。\n"
+                 "房间号不用自己编 —— 留空就自动用本机生成的，创建完会显示出来。",
+            style="Hint.TLabel", justify="left",
+        )
+        self._relay_hint.grid(row=9, column=1, sticky="w")
         self._toggle_relay()
 
         buttons = ttk.Frame(body)
@@ -335,9 +373,12 @@ class CreateRoomDialog(tk.Toplevel):
         widget.grid(row=row, column=1, sticky="w", pady=4)
 
     def _toggle_relay(self) -> None:
-        state = "normal" if self.use_relay.get() else "disabled"
+        on = self.use_relay.get()
+        state = "normal" if on else "disabled"
         for _label, widget in self._relay_rows:
             widget.configure(state=state)
+        if hasattr(self, "_relay_hint"):
+            self._relay_hint.configure(foreground="#888888" if on else "#bbbbbb")
 
     def _center(self, master: tk.Misc) -> None:
         self.update_idletasks()
@@ -472,7 +513,10 @@ class JoinRoomDialog(tk.Toplevel):
             ttk.Label(row, text=label, width=10).pack(side="left")
             ttk.Entry(row, textvariable=var, width=26, show=show).pack(side="left")
         ttk.Label(
-            frame, text="中继地址格式 host:端口；房间号是房主在那台中继上用的号。", style="Hint.TLabel"
+            frame,
+            text="中继地址格式 host:端口，比如 1.2.3.4:9000。\n"
+                 "房间号就是房主那边显示的「中继房间号」—— 让他点一下「复制房间号」发给你。",
+            style="Hint.TLabel", justify="left",
         ).pack(anchor="w", pady=(10, 0))
         return frame
 

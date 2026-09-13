@@ -95,6 +95,47 @@ def local_ip() -> str:
         sock.close()
 
 
+def global_ipv6() -> Optional[str]:
+    """拿到本机全球可达的 IPv6 地址，没有就返回 None。
+
+    **为什么值得单独拎出来**：国内运营商大范围上了 IPv6，而且 IPv6 通常
+    **不做 NAT** —— 每台设备拿到的就是全球可路由的地址。所以哪怕宽带在
+    CGNAT 后面（IPv4 没有公网地址），只要两边都有 IPv6，照样能直接互连，
+    不需要中继、也不用装任何额外软件。
+
+    会跳过链路本地（fe80::）、回环和唯一本地（fc00::/7）—— 那些出了本机就没用了。
+    """
+    import ipaddress
+
+    seen = []
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET6)
+        seen.extend(info[4][0] for info in infos)
+    except (socket.gaierror, OSError):
+        pass
+
+    # hostname 解析不一定全，再问问"连外网时用哪张网卡"
+    probe = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("2001:4860:4860::8888", 80))   # Google DNS 的 v6 地址
+        seen.append(probe.getsockname()[0])
+    except OSError:
+        pass
+    finally:
+        probe.close()
+
+    for raw in seen:
+        address = raw.split("%")[0]   # 去掉 %eth0 这种 scope id
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        if ip.is_link_local or ip.is_loopback or ip.is_private or ip.is_multicast:
+            continue
+        return address
+    return None
+
+
 def broadcast_targets() -> List[str]:
     """所有值得发一份广播的目标地址。"""
     targets = ["255.255.255.255"]
